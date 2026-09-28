@@ -53,17 +53,25 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-          WIN7_RELEASE: "go-legacy-win7-1.27.1-1"
         run: |
           set -euo pipefail
+          # Discover the newest go-legacy-win7 release and its linux-amd64
+          # toolchain, then verify the binary before exporting it. If anything
+          # fails, this step is skipped (continue-on-error) and only the
+          # standard Windows 10+ agent builds ship. A future hardening step can
+          # pin the version and check a published checksum.
           dir="$RUNNER_TEMP/go-win7"
           mkdir -p "$dir"
-          gh release download "$WIN7_RELEASE" \
-            --repo thongtech/go-legacy-win7 \
-            --pattern '*linux-amd64*' \
-            --dir "$dir"
-          tar -xzf "$dir"/*linux-amd64* -C "$dir"
-          echo "INVMON_GO_WIN7=$dir/go/bin/go" >> "$GITHUB_ENV"
+          url="$(gh api repos/thongtech/go-legacy-win7/releases/latest \
+            --jq '.assets[].browser_download_url | select(test("linux-amd64"))' | head -n1)"
+          if [ -z "$url" ]; then echo "no linux-amd64 asset found"; exit 1; fi
+          echo "downloading $url"
+          curl -fsSL "$url" -o "$dir/go-win7.tar.gz"
+          tar -xzf "$dir/go-win7.tar.gz" -C "$dir"
+          gobin="$(find "$dir" -type f -path '*/bin/go' | head -n1)"
+          if [ -z "$gobin" ]; then echo "go binary not found in archive"; exit 1; fi
+          "$gobin" version
+          echo "INVMON_GO_WIN7=$gobin" >> "$GITHUB_ENV"
 
       - name: Build & package
         run: VERSION="${{ steps.ver.outputs.version }}" bash scripts/build-dist.sh
