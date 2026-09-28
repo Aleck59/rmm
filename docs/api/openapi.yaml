@@ -1,0 +1,2657 @@
+openapi: 3.1.0
+info:
+  title: InvMon API
+  version: 1.0.0-draft
+  summary: Мониторинг и инвентаризация парка Windows-ПК организации (MVP)
+  description: |
+    Контракт API (contract-first): из этого файла генерируются серверные интерфейсы
+    (oapi-codegen) и TypeScript-типы для веб-интерфейса (openapi-typescript).
+
+    Два независимых набора эндпоинтов на разных портах:
+
+    * **Agent API** — `/api/agent/v1/*`, порт 8443, доступен из сетей рабочих станций.
+      Аутентификация: `Authorization: Bearer <токен>` (токен регистрации или токен устройства).
+    * **Web API** — `/api/v1/*`, порт 443, доступен только из сети администраторов.
+      Аутентификация: сессионная cookie `__Host-invmon_session` (HttpOnly, Secure, SameSite=Strict).
+
+    Агент **не принимает команд**: ответы сервера содержат только декларативную конфигурацию
+    сбора данных из фиксированного набора полей.
+
+    Общие соглашения:
+    * время — RFC 3339 в UTC; размеры — в байтах (int64); проценты — 0…100;
+    * ошибки — RFC 9457 `application/problem+json` с машинным полем `code`;
+    * списки — курсорная пагинация (`limit`, `cursor` → `next_cursor`);
+    * агент может сжимать тело запроса (`Content-Encoding: gzip`); лимит тела после распаковки —
+      1 МБ для метрик и 5 МБ для инвентаризации;
+    * роль, необходимая для операции Web API, указана в расширении `x-required-role`
+      (`viewer` < `operator` < `admin`).
+  license:
+    name: Proprietary (internal use)
+    identifier: LicenseRef-Proprietary
+
+servers:
+  - url: https://invmon.corp.local
+    description: Web API (порт 443)
+
+tags:
+  - name: agent
+    description: Эндпоинты для агентов
+  - name: auth
+    description: Вход в веб-интерфейс
+  - name: devices
+    description: Устройства, метрики, инвентаризация
+  - name: software
+    description: Каталог и отчёты по установленному ПО
+  - name: alerts
+    description: Правила алертов, алерты, каналы уведомлений
+  - name: admin
+    description: Токены регистрации, аудит
+
+security:
+  - session: []
+
+paths:
+  # ===========================================================================
+  # Agent API
+  # ===========================================================================
+  /api/agent/v1/enroll:
+    servers:
+      - url: https://invmon.corp.local:8443
+        description: Agent API (порт 8443)
+    post:
+      tags: [agent]
+      operationId: agentEnroll
+      summary: Регистрация агента
+      description: |
+        Первичная регистрация по токену регистрации (`imenr_…`). Идемпотентна по `agent_uid`:
+        повтор после потерянного ответа не создаёт дубль, а перевыпускает токен устройства.
+        Токен устройства возвращается один раз; сервер хранит только его SHA-256.
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollRequest'
+      responses:
+        '201':
+          description: Устройство зарегистрировано
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnrollResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/agent/v1/metrics:
+    servers:
+      - url: https://invmon.corp.local:8443
+        description: Agent API (порт 8443)
+    post:
+      tags: [agent]
+      operationId: agentPostMetrics
+      summary: Пачка метрик (одновременно heartbeat)
+      description: |
+        Агент отправляет накопленные выборки раз в `metrics_send_interval_s` (по умолчанию 60 с);
+        после сбоя связи — из локального буфера, частями до 1000 выборок.
+        Повторная отправка безопасна: ключ выборки — (устройство, `ts`[, `volume`]).
+        Сервер корректирует метки времени на расхождение часов (`sent_at` против времени сервера).
+      security:
+        - deviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/ContentEncoding'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MetricsBatch'
+      responses:
+        '200':
+          description: Принято
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/DeviceForbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/agent/v1/inventory:
+    servers:
+      - url: https://invmon.corp.local:8443
+        description: Agent API (порт 8443)
+    put:
+      tags: [agent]
+      operationId: agentPutInventory
+      summary: Полный снимок инвентаризации
+      description: |
+        Отправляется при старте агента, при изменении `inventory_hash` (проверка раз в час)
+        и не реже раза в сутки. Сервер сравнивает снимок с текущим состоянием и пишет
+        изменения в журнал `inventory_changes`.
+      security:
+        - deviceToken: []
+      parameters:
+        - $ref: '#/components/parameters/ContentEncoding'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Inventory'
+      responses:
+        '200':
+          description: Снимок принят
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InventoryResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/DeviceForbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/agent/v1/config:
+    servers:
+      - url: https://invmon.corp.local:8443
+        description: Agent API (порт 8443)
+    get:
+      tags: [agent]
+      operationId: agentGetConfig
+      summary: Конфигурация сбора
+      description: Запрашивается, когда `config_version` в ответе на метрики больше локальной.
+      security:
+        - deviceToken: []
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+          example: '"3"'
+      responses:
+        '200':
+          description: Актуальная конфигурация
+          headers:
+            ETag:
+              schema:
+                type: string
+              example: '"3"'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentConfig'
+        '304':
+          description: Конфигурация не изменилась
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/DeviceForbidden'
+
+  /api/agent/v1/token/rotate:
+    servers:
+      - url: https://invmon.corp.local:8443
+        description: Agent API (порт 8443)
+    post:
+      tags: [agent]
+      operationId: agentRotateToken
+      summary: Ротация токена устройства
+      description: |
+        Вызывается, когда сервер вернул `rotate_token: true` (по умолчанию — раз в 90 дней).
+        Старый токен остаётся действительным до `previous_valid_until` на случай потери ответа.
+      security:
+        - deviceToken: []
+      responses:
+        '200':
+          description: Выпущен новый токен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenRotateResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/DeviceForbidden'
+
+  # ===========================================================================
+  # Web API — аутентификация
+  # ===========================================================================
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Вход по логину и паролю
+      description: |
+        При успехе устанавливает cookie `__Host-invmon_session`. Ошибка всегда одна и та же
+        (`invalid_credentials`), чтобы не раскрывать существование логина. После 10 неудачных
+        попыток учётная запись блокируется на 15 минут.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '204':
+          description: Успешный вход
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              example: __Host-invmon_session=Q2hhbmdlTWU...; Path=/; Secure; HttpOnly; SameSite=Strict
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: Выход (сессия удаляется на сервере)
+      x-required-role: viewer
+      responses:
+        '204':
+          description: Сессия завершена
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/auth/me:
+    get:
+      tags: [auth]
+      operationId: getCurrentUser
+      summary: Текущий пользователь
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Пользователь и его роль
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CurrentUser'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ===========================================================================
+  # Web API — устройства
+  # ===========================================================================
+  /api/v1/devices:
+    get:
+      tags: [devices]
+      operationId: listDevices
+      summary: Список устройств с фильтрами
+      x-required-role: viewer
+      parameters:
+        - name: q
+          in: query
+          description: Поиск по подстроке в hostname / IP / серийном номере
+          schema:
+            type: string
+            maxLength: 100
+        - name: group_id
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: tag
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/DeviceStatus'
+        - name: online
+          in: query
+          schema:
+            type: boolean
+        - name: has_alerts
+          in: query
+          schema:
+            type: boolean
+        - name: sort
+          in: query
+          schema:
+            type: string
+            default: hostname
+            enum: [hostname, -hostname, last_seen_at, -last_seen_at, cpu_pct, -cpu_pct,
+                   mem_used_pct, -mem_used_pct, min_disk_free_pct, -min_disk_free_pct]
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница списка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceListPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/devices/{deviceId}:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    get:
+      tags: [devices]
+      operationId: getDevice
+      summary: Карточка устройства (железо, тома, сеть, состояние)
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Карточка устройства
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceDetails'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [devices]
+      operationId: updateDevice
+      summary: Изменить группу, теги, заметки
+      x-required-role: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DevicePatch'
+      responses:
+        '200':
+          description: Обновлённая карточка
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceDetails'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [devices]
+      operationId: deleteDevice
+      summary: Удалить устройство вместе с данными
+      description: Токен агента перестаёт действовать; действие попадает в аудит.
+      x-required-role: admin
+      responses:
+        '204':
+          description: Удалено
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/devices/{deviceId}/approve:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    post:
+      tags: [devices]
+      operationId: approveDevice
+      summary: Одобрить устройство в статусе pending
+      x-required-role: operator
+      responses:
+        '204':
+          description: Устройство активировано
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/devices/{deviceId}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    post:
+      tags: [devices]
+      operationId: revokeDevice
+      summary: Отозвать токен устройства (данные сохраняются)
+      x-required-role: admin
+      responses:
+        '204':
+          description: Токен отозван, статус revoked
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/devices/{deviceId}/inventory-refresh:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    post:
+      tags: [devices]
+      operationId: requestInventoryRefresh
+      summary: Запросить внеочередную инвентаризацию
+      description: Выставляет флаг; агент увидит его в ответе на следующую пачку метрик.
+      x-required-role: operator
+      responses:
+        '202':
+          description: Запрос принят
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/devices/{deviceId}/metrics:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    get:
+      tags: [devices]
+      operationId: getDeviceMetrics
+      summary: Ряды метрик для графиков
+      description: |
+        Разрешение при `resolution=auto`: диапазон ≤ 48 ч — сырые минутные точки;
+        до 14 дней — корзины по 15 минут; больше — часовые агрегаты.
+        Формат колоночный (массивы одинаковой длины) — удобно для графиков.
+      x-required-role: viewer
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: resolution
+          in: query
+          schema:
+            type: string
+            enum: [auto, raw, 15m, 1h]
+            default: auto
+      responses:
+        '200':
+          description: Ряды метрик
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceMetrics'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/devices/{deviceId}/software:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    get:
+      tags: [devices, software]
+      operationId: listDeviceSoftware
+      summary: Установленное ПО на устройстве
+      x-required-role: viewer
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 100
+        - name: include_removed
+          in: query
+          description: Включить удалённое ПО (история)
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Список ПО
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/InstalledSoftware'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ===========================================================================
+  # Web API — ПО
+  # ===========================================================================
+  /api/v1/software:
+    get:
+      tags: [software]
+      operationId: listSoftware
+      summary: Сводный каталог ПО по парку
+      x-required-role: viewer
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+            maxLength: 100
+        - name: publisher
+          in: query
+          schema:
+            type: string
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [name, -device_count]
+            default: -device_count
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница каталога
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoftwareCatalogPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/software/{softwareId}/devices:
+    parameters:
+      - name: softwareId
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+    get:
+      tags: [software]
+      operationId: listSoftwareDevices
+      summary: На каких устройствах установлено ПО
+      x-required-role: viewer
+      parameters:
+        - name: version_lt
+          in: query
+          description: Только версии ниже указанной (сравнение по числовым компонентам), например `23.01`
+          schema:
+            type: string
+        - name: format
+          in: query
+          description: '`csv` — выгрузка файлом (фиксируется в аудите)'
+          schema:
+            type: string
+            enum: [json, csv]
+            default: json
+      responses:
+        '200':
+          description: Устройства с этим ПО
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SoftwareInstallation'
+            text/csv:
+              schema:
+                type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ===========================================================================
+  # Web API — алерты и уведомления
+  # ===========================================================================
+  /api/v1/alert-rules:
+    get:
+      tags: [alerts]
+      operationId: listAlertRules
+      summary: Правила алертов
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Все правила
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AlertRule'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [alerts]
+      operationId: createAlertRule
+      summary: Создать правило
+      x-required-role: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertRuleInput'
+            examples:
+              diskC:
+                summary: Свободно на C < 10 %
+                value:
+                  name: Мало места на системном диске
+                  enabled: true
+                  severity: critical
+                  metric: disk_free_pct
+                  operator: '<'
+                  threshold: 10
+                  resolve_threshold: 12
+                  duration_s: 0
+                  volume_pattern: 'C:'
+                  scope: {group_id: null, tag: null}
+                  channel_ids: [1, 2]
+                  renotify_interval_s: 86400
+              cpu:
+                summary: CPU > 90 % дольше 15 минут
+                value:
+                  name: Высокая загрузка CPU
+                  severity: warning
+                  metric: cpu_pct
+                  operator: '>'
+                  threshold: 90
+                  resolve_threshold: 80
+                  duration_s: 900
+                  scope: {group_id: 3, tag: null}
+                  channel_ids: [1]
+              offline:
+                summary: Нет данных дольше 10 минут
+                value:
+                  name: Устройство не на связи
+                  severity: warning
+                  metric: offline
+                  duration_s: 600
+                  channel_ids: [1]
+      responses:
+        '201':
+          description: Правило создано
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/alert-rules/{ruleId}:
+    parameters:
+      - name: ruleId
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+    get:
+      tags: [alerts]
+      operationId: getAlertRule
+      summary: Правило
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Правило
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRule'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [alerts]
+      operationId: replaceAlertRule
+      summary: Изменить правило
+      x-required-role: operator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertRuleInput'
+      responses:
+        '200':
+          description: Правило обновлено
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertRule'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [alerts]
+      operationId: deleteAlertRule
+      summary: Удалить правило (активные алерты закрываются, история сохраняется)
+      x-required-role: operator
+      responses:
+        '204':
+          description: Удалено
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/alerts:
+    get:
+      tags: [alerts]
+      operationId: listAlerts
+      summary: Алерты (активные и история)
+      x-required-role: viewer
+      parameters:
+        - name: state
+          in: query
+          schema:
+            type: string
+            enum: [firing, resolved]
+        - name: severity
+          in: query
+          schema:
+            $ref: '#/components/schemas/Severity'
+        - name: device_id
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: acknowledged
+          in: query
+          schema:
+            type: boolean
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница алертов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/alerts/{alertId}/ack:
+    parameters:
+      - name: alertId
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+    post:
+      tags: [alerts]
+      operationId: acknowledgeAlert
+      summary: Подтвердить алерт (останавливает повторные уведомления)
+      x-required-role: operator
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                comment:
+                  type: string
+                  maxLength: 1000
+      responses:
+        '200':
+          description: Алерт подтверждён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Alert'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/notification-channels:
+    get:
+      tags: [alerts]
+      operationId: listNotificationChannels
+      summary: Каналы уведомлений
+      x-required-role: viewer
+      responses:
+        '200':
+          description: Все каналы (секреты не возвращаются)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/NotificationChannel'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [alerts]
+      operationId: createNotificationChannel
+      summary: Создать канал (email или webhook)
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NotificationChannelInput'
+            examples:
+              email:
+                value:
+                  name: ИТ-дежурные (почта)
+                  type: email
+                  min_severity: warning
+                  config: {to: [it-alerts@corp.local]}
+              webhook:
+                value:
+                  name: Чат ИТ-отдела
+                  type: webhook
+                  min_severity: critical
+                  config: {url: 'https://hooks.corp.local/invmon', timeout_s: 10}
+                  secret: 'generate-a-random-32-byte-secret'
+      responses:
+        '201':
+          description: Канал создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationChannel'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/notification-channels/{channelId}/test:
+    parameters:
+      - name: channelId
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+    post:
+      tags: [alerts]
+      operationId: testNotificationChannel
+      summary: Отправить тестовое уведомление
+      x-required-role: admin
+      responses:
+        '202':
+          description: Тестовое сообщение поставлено в очередь (результат — в журнале доставки)
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ===========================================================================
+  # Web API — администрирование
+  # ===========================================================================
+  /api/v1/enrollment-tokens:
+    get:
+      tags: [admin]
+      operationId: listEnrollmentTokens
+      summary: Токены регистрации агентов
+      x-required-role: admin
+      responses:
+        '200':
+          description: Токены (без секретной части)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/EnrollmentToken'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [admin]
+      operationId: createEnrollmentToken
+      summary: Выпустить токен регистрации
+      x-required-role: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollmentTokenInput'
+      responses:
+        '201':
+          description: Токен выпущен; значение показывается только в этом ответе
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnrollmentTokenCreated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/enrollment-tokens/{tokenId}/revoke:
+    parameters:
+      - name: tokenId
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+    post:
+      tags: [admin]
+      operationId: revokeEnrollmentToken
+      summary: Отозвать токен регистрации (уже зарегистрированные агенты продолжают работу)
+      x-required-role: admin
+      responses:
+        '204':
+          description: Отозван
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/audit-log:
+    get:
+      tags: [admin]
+      operationId: listAuditLog
+      summary: Журнал аудита
+      x-required-role: admin
+      parameters:
+        - name: actor_type
+          in: query
+          schema:
+            type: string
+            enum: [user, agent, system]
+        - name: actor
+          in: query
+          description: Логин пользователя или hostname агента
+          schema:
+            type: string
+        - name: action
+          in: query
+          description: Точное действие или префикс с `*`, например `alert_rule.*`
+          schema:
+            type: string
+        - name: result
+          in: query
+          schema:
+            type: string
+            enum: [success, failure]
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница журнала
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+# =============================================================================
+# Исходящие webhook-уведомления (сервер → внешняя система)
+# =============================================================================
+webhooks:
+  alertEvent:
+    post:
+      operationId: alertWebhook
+      summary: Событие алерта
+      description: |
+        Отправляется на URL канала типа `webhook`. Заголовки:
+        `X-InvMon-Event` (тип события), `X-InvMon-Delivery` (UUID доставки — для идемпотентности у получателя),
+        `X-InvMon-Signature: t=<unix-время>,v1=<hex HMAC-SHA256(secret, "<t>.<тело>")>`.
+        Получатель должен проверять подпись и отбрасывать сообщения с `t` старше 5 минут.
+        Ожидается ответ 2xx за `timeout_s`; иначе — повтор с экспоненциальной задержкой (до 10 попыток).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookEvent'
+      responses:
+        '200':
+          description: Принято получателем
+
+components:
+  securitySchemes:
+    enrollmentToken:
+      type: http
+      scheme: bearer
+      description: Токен регистрации `imenr_…` (выдаётся администратором, ограничен сроком и числом использований)
+    deviceToken:
+      type: http
+      scheme: bearer
+      description: Токен устройства `imagt_…` (256 бит случайных данных; на сервере хранится SHA-256)
+    session:
+      type: apiKey
+      in: cookie
+      name: __Host-invmon_session
+
+  parameters:
+    DeviceId:
+      name: deviceId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      description: Непрозрачный курсор из `next_cursor` предыдущей страницы
+      schema:
+        type: string
+    ContentEncoding:
+      name: Content-Encoding
+      in: header
+      required: false
+      schema:
+        type: string
+        enum: [gzip, identity]
+
+  responses:
+    BadRequest:
+      description: Некорректный запрос / ошибка валидации
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://invmon.corp.local/problems/validation
+            title: Validation failed
+            status: 400
+            code: validation_failed
+            errors:
+              - field: host[3].cpu_pct
+                message: must be between 0 and 100
+    Unauthorized:
+      description: Нет или неверные учётные данные / токен
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://invmon.corp.local/problems/unauthorized
+            title: Invalid or expired token
+            status: 401
+            code: invalid_token
+    Forbidden:
+      description: Недостаточно прав
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    DeviceForbidden:
+      description: |
+        Устройство не может отправлять данные: `code` = `pending_approval` (ждёт одобрения —
+        агент повторяет раз в 5 минут) или `device_revoked` (агент прекращает отправку).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://invmon.corp.local/problems/pending-approval
+            title: Device is pending approval
+            status: 403
+            code: pending_approval
+    NotFound:
+      description: Объект не найден
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: Конфликт состояния (например, алерт уже закрыт)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PayloadTooLarge:
+      description: Превышен лимит размера тела (после распаковки)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Превышен лимит запросов; агент обязан выдержать паузу из `Retry-After`
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Секунды до повтора
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    # ------------------------------------------------------------------ общие
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        code:
+          type: string
+          description: Машинный код ошибки
+          examples: [invalid_token, validation_failed, pending_approval, device_revoked, rate_limited]
+        errors:
+          type: array
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+    Severity:
+      type: string
+      enum: [info, warning, critical]
+    DeviceStatus:
+      type: string
+      enum: [pending, active, revoked, retired]
+    Arch:
+      type: string
+      enum: [x86, x64, arm64]
+    Percent:
+      type: number
+      format: float
+      minimum: 0
+      maximum: 100
+    Bytes:
+      type: integer
+      format: int64
+      minimum: 0
+
+    # ------------------------------------------------------------ Agent API
+    AgentConfig:
+      type: object
+      description: Декларативная конфигурация сбора — единственное, что сервер «сообщает» агенту
+      required: [config_version, metrics_send_interval_s, cpu_sample_interval_s, disk_interval_s,
+                 inventory_interval_s, inventory_full_resend_s, collect_logged_on_user]
+      properties:
+        config_version:
+          type: integer
+          minimum: 1
+        metrics_send_interval_s:
+          type: integer
+          minimum: 30
+          maximum: 600
+          default: 60
+        cpu_sample_interval_s:
+          type: integer
+          minimum: 5
+          maximum: 60
+          default: 15
+        disk_interval_s:
+          type: integer
+          minimum: 60
+          maximum: 3600
+          default: 300
+        inventory_interval_s:
+          type: integer
+          minimum: 600
+          maximum: 86400
+          default: 3600
+          description: Как часто агент пересчитывает хэш инвентаризации
+        inventory_full_resend_s:
+          type: integer
+          minimum: 3600
+          maximum: 604800
+          default: 86400
+          description: Как часто отправлять полный снимок, даже если хэш не изменился
+        collect_logged_on_user:
+          type: boolean
+          default: false
+          description: Передавать ли имя пользователя активной сессии (решение по политике организации)
+      example:
+        config_version: 3
+        metrics_send_interval_s: 60
+        cpu_sample_interval_s: 15
+        disk_interval_s: 300
+        inventory_interval_s: 3600
+        inventory_full_resend_s: 86400
+        collect_logged_on_user: false
+
+    OsInfo:
+      type: object
+      required: [name, version, arch]
+      properties:
+        name:
+          type: string
+          maxLength: 256
+          description: Win32_OperatingSystem.Caption
+        version:
+          type: string
+          maxLength: 64
+          description: Версия с UBR, например 10.0.22631.4169
+        build:
+          type: integer
+        ubr:
+          type: integer
+        display_version:
+          type: string
+          maxLength: 32
+          description: DisplayVersion / ReleaseId из реестра (23H2, 22H2…) либо «SP1» для Windows 7
+        arch:
+          $ref: '#/components/schemas/Arch'
+        install_date:
+          type: string
+          format: date-time
+        last_boot:
+          type: string
+          format: date-time
+
+    HardwareIds:
+      type: object
+      description: Идентификаторы для поиска дублей и переустановок (не для аутентификации)
+      properties:
+        machine_guid:
+          type: string
+          maxLength: 64
+        smbios_uuid:
+          type: [string, 'null']
+          format: uuid
+        serial_number:
+          type: string
+          maxLength: 128
+        macs:
+          type: array
+          maxItems: 32
+          items:
+            type: string
+            pattern: '^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$'
+
+    EnrollRequest:
+      type: object
+      required: [agent_uid, agent_version, hostname, os, hardware_ids]
+      properties:
+        agent_uid:
+          type: string
+          format: uuid
+          description: Случайный UUID, созданный агентом при установке (ключ идемпотентности)
+        agent_version:
+          type: string
+          maxLength: 32
+        hostname:
+          type: string
+          maxLength: 255
+        domain:
+          type: string
+          maxLength: 255
+        os:
+          $ref: '#/components/schemas/OsInfo'
+        hardware_ids:
+          $ref: '#/components/schemas/HardwareIds'
+      example:
+        agent_uid: 5b7c1c7e-2f3a-4c55-9a0e-3c1f9f0d2a11
+        agent_version: 1.0.0
+        hostname: PC-ACC-012
+        domain: CORP
+        os:
+          name: Microsoft Windows 10 Pro
+          version: 10.0.19045.4894
+          build: 19045
+          ubr: 4894
+          display_version: 22H2
+          arch: x64
+        hardware_ids:
+          machine_guid: 0f5e4a1c-9d3b-4c2e-8f7a-1b2c3d4e5f60
+          smbios_uuid: 4c4c4544-0042-3510-8052-b4c04f4b4b32
+          serial_number: B4KK2X2
+          macs: ['3C:52:82:11:22:33']
+
+    EnrollResponse:
+      type: object
+      required: [device_id, device_token, status, config]
+      properties:
+        device_id:
+          type: integer
+          format: int64
+        device_token:
+          type: string
+          description: Токен устройства; агент хранит его зашифрованным DPAPI (LocalMachine)
+        status:
+          type: string
+          enum: [active, pending]
+        config:
+          $ref: '#/components/schemas/AgentConfig'
+      example:
+        device_id: 42
+        device_token: imagt_3q2-7wEXAMPLEonlyNotARealTokenZ9fQ1mKp0Lr8sVxYc
+        status: active
+        config:
+          config_version: 3
+          metrics_send_interval_s: 60
+          cpu_sample_interval_s: 15
+          disk_interval_s: 300
+          inventory_interval_s: 3600
+          inventory_full_resend_s: 86400
+          collect_logged_on_user: false
+
+    HostSample:
+      type: object
+      required: [ts, cpu_pct, cpu_max_pct, mem_used_bytes, mem_total_bytes]
+      properties:
+        ts:
+          type: string
+          format: date-time
+          description: Конец интервала усреднения (часы агента; сервер корректирует расхождение)
+        cpu_pct:
+          $ref: '#/components/schemas/Percent'
+        cpu_max_pct:
+          $ref: '#/components/schemas/Percent'
+        mem_used_bytes:
+          $ref: '#/components/schemas/Bytes'
+        mem_total_bytes:
+          $ref: '#/components/schemas/Bytes'
+
+    DiskSample:
+      type: object
+      required: [ts, volume, total_bytes, free_bytes]
+      properties:
+        ts:
+          type: string
+          format: date-time
+        volume:
+          type: string
+          pattern: '^[A-Z]:$'
+        total_bytes:
+          $ref: '#/components/schemas/Bytes'
+        free_bytes:
+          $ref: '#/components/schemas/Bytes'
+
+    CollectorError:
+      type: object
+      required: [collector, message]
+      properties:
+        collector:
+          type: string
+          examples: [wmi.Win32_PhysicalMemory, registry.uninstall, disk.C]
+        message:
+          type: string
+          maxLength: 500
+        at:
+          type: string
+          format: date-time
+
+    AgentHealth:
+      type: object
+      required: [version]
+      properties:
+        version:
+          type: string
+        uptime_s:
+          type: integer
+          format: int64
+        rss_bytes:
+          $ref: '#/components/schemas/Bytes'
+        spool_items:
+          type: integer
+          description: Сколько пачек ждёт отправки в локальном буфере
+        errors:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/CollectorError'
+
+    MetricsBatch:
+      type: object
+      required: [sent_at, host]
+      properties:
+        sent_at:
+          type: string
+          format: date-time
+          description: Время отправки по часам агента — для оценки расхождения часов
+        boot_time:
+          type: string
+          format: date-time
+        logged_on_user:
+          type: [string, 'null']
+          maxLength: 256
+          description: Только если `collect_logged_on_user = true`
+        host:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/HostSample'
+        disks:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/DiskSample'
+        agent:
+          $ref: '#/components/schemas/AgentHealth'
+      example:
+        sent_at: '2026-09-28T09:15:00Z'
+        boot_time: '2026-09-28T06:02:11Z'
+        host:
+          - ts: '2026-09-28T09:14:00Z'
+            cpu_pct: 12.4
+            cpu_max_pct: 38.0
+            mem_used_bytes: 6012345344
+            mem_total_bytes: 8467914752
+          - ts: '2026-09-28T09:15:00Z'
+            cpu_pct: 9.8
+            cpu_max_pct: 21.5
+            mem_used_bytes: 6010245120
+            mem_total_bytes: 8467914752
+        disks:
+          - ts: '2026-09-28T09:15:00Z'
+            volume: 'C:'
+            total_bytes: 255369105408
+            free_bytes: 20132659200
+        agent:
+          version: 1.0.0
+          uptime_s: 11570
+          rss_bytes: 18350080
+          spool_items: 0
+          errors: []
+
+    MetricsResponse:
+      type: object
+      required: [accepted, config_version, inventory_requested, rotate_token]
+      properties:
+        accepted:
+          type: object
+          required: [host, disks]
+          properties:
+            host:
+              type: integer
+            disks:
+              type: integer
+        config_version:
+          type: integer
+          description: Если больше локальной — агент запрашивает GET /config
+        inventory_requested:
+          type: boolean
+          description: Администратор нажал «Обновить инвентаризацию»
+        rotate_token:
+          type: boolean
+      example:
+        accepted: {host: 2, disks: 1}
+        config_version: 3
+        inventory_requested: false
+        rotate_token: false
+
+    Inventory:
+      type: object
+      required: [collected_at, inventory_hash, os, system, cpu, memory, disks, volumes, network, software]
+      properties:
+        collected_at:
+          type: string
+          format: date-time
+        inventory_hash:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: SHA-256 канонического JSON снимка (без collected_at)
+        os:
+          $ref: '#/components/schemas/OsInfo'
+        system:
+          type: object
+          properties:
+            manufacturer:
+              type: string
+            model:
+              type: string
+            serial_number:
+              type: string
+            smbios_uuid:
+              type: [string, 'null']
+              format: uuid
+            machine_guid:
+              type: string
+            bios_vendor:
+              type: string
+            bios_version:
+              type: string
+            bios_date:
+              type: [string, 'null']
+              format: date
+            domain:
+              type: string
+            part_of_domain:
+              type: boolean
+        cpu:
+          type: array
+          maxItems: 8
+          items:
+            type: object
+            required: [model]
+            properties:
+              model:
+                type: string
+              cores:
+                type: integer
+              threads:
+                type: integer
+              max_mhz:
+                type: integer
+        memory:
+          type: object
+          required: [total_bytes]
+          properties:
+            total_bytes:
+              $ref: '#/components/schemas/Bytes'
+            modules:
+              type: array
+              maxItems: 64
+              items:
+                type: object
+                properties:
+                  slot:
+                    type: string
+                  size_bytes:
+                    $ref: '#/components/schemas/Bytes'
+                  speed_mhz:
+                    type: integer
+                  manufacturer:
+                    type: string
+                  part_number:
+                    type: string
+        disks:
+          type: array
+          maxItems: 64
+          items:
+            $ref: '#/components/schemas/PhysicalDisk'
+        volumes:
+          type: array
+          maxItems: 26
+          items:
+            $ref: '#/components/schemas/Volume'
+        network:
+          type: array
+          maxItems: 32
+          items:
+            $ref: '#/components/schemas/NetworkAdapter'
+        software:
+          type: array
+          maxItems: 5000
+          items:
+            $ref: '#/components/schemas/SoftwareEntry'
+        errors:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/CollectorError'
+      example:
+        collected_at: '2026-09-28T09:00:03Z'
+        inventory_hash: sha256:6f1c2b0d9e8a7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a291807f6e5d4c3b2a19080
+        os:
+          name: Microsoft Windows 11 Pro
+          version: 10.0.22631.4169
+          build: 22631
+          ubr: 4169
+          display_version: 23H2
+          arch: x64
+          install_date: '2024-02-11T10:20:00Z'
+          last_boot: '2026-09-28T06:02:11Z'
+        system:
+          manufacturer: Dell Inc.
+          model: OptiPlex 7090
+          serial_number: B4KK2X2
+          smbios_uuid: 4c4c4544-0042-3510-8052-b4c04f4b4b32
+          machine_guid: 0f5e4a1c-9d3b-4c2e-8f7a-1b2c3d4e5f60
+          bios_vendor: Dell Inc.
+          bios_version: 1.21.0
+          bios_date: '2024-05-14'
+          domain: corp.local
+          part_of_domain: true
+        cpu:
+          - model: Intel(R) Core(TM) i5-10500 CPU @ 3.10GHz
+            cores: 6
+            threads: 12
+            max_mhz: 3101
+        memory:
+          total_bytes: 17179869184
+          modules:
+            - slot: DIMM1
+              size_bytes: 8589934592
+              speed_mhz: 2666
+              manufacturer: Samsung
+              part_number: M378A1K43DB2-CTD
+            - slot: DIMM2
+              size_bytes: 8589934592
+              speed_mhz: 2666
+              manufacturer: Samsung
+              part_number: M378A1K43DB2-CTD
+        disks:
+          - index: 0
+            model: KXG60ZNV256G NVMe KIOXIA 256GB
+            serial_number: X0NS10ABCDEF
+            media_type: SSD
+            bus_type: NVMe
+            size_bytes: 256060514304
+            status: OK
+        volumes:
+          - volume: 'C:'
+            label: ''
+            filesystem: NTFS
+            total_bytes: 255369105408
+            free_bytes: 20132659200
+        network:
+          - name: Ethernet
+            description: Intel(R) Ethernet Connection (11) I219-LM
+            mac: '3C:52:82:11:22:33'
+            speed_mbps: 1000
+            dhcp_enabled: true
+            ipv4: [192.168.10.23/24]
+            ipv6: []
+            gateways: [192.168.10.1]
+            dns_servers: [192.168.10.5, 192.168.10.6]
+        software:
+          - display_name: 7-Zip 23.01 (x64)
+            version: '23.01'
+            publisher: Igor Pavlov
+            install_date: '2024-03-02'
+            arch: x64
+            scope: machine
+          - display_name: Google Chrome
+            version: 129.0.6668.90
+            publisher: Google LLC
+            arch: x64
+            scope: machine
+            msi_product_code: 8b4a6b3c-2f6e-3a1d-9b7c-5e4d3c2b1a09
+        errors: []
+
+    PhysicalDisk:
+      type: object
+      required: [index]
+      properties:
+        index:
+          type: integer
+        model:
+          type: string
+        serial_number:
+          type: string
+        media_type:
+          type: string
+          enum: [SSD, HDD, Unknown]
+        bus_type:
+          type: string
+        size_bytes:
+          $ref: '#/components/schemas/Bytes'
+        status:
+          type: string
+
+    Volume:
+      type: object
+      required: [volume, total_bytes, free_bytes]
+      properties:
+        volume:
+          type: string
+          pattern: '^[A-Z]:$'
+        label:
+          type: string
+        filesystem:
+          type: string
+        total_bytes:
+          $ref: '#/components/schemas/Bytes'
+        free_bytes:
+          $ref: '#/components/schemas/Bytes'
+        free_pct:
+          allOf:
+            - $ref: '#/components/schemas/Percent'
+          readOnly: true
+          description: Вычисляется сервером
+
+    NetworkAdapter:
+      type: object
+      required: [mac]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        mac:
+          type: string
+          pattern: '^([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}$'
+        speed_mbps:
+          type: [integer, 'null']
+        dhcp_enabled:
+          type: boolean
+        ipv4:
+          type: array
+          items:
+            type: string
+            description: Адрес с префиксом, например 192.168.10.23/24
+        ipv6:
+          type: array
+          items:
+            type: string
+        gateways:
+          type: array
+          items:
+            type: string
+        dns_servers:
+          type: array
+          items:
+            type: string
+
+    SoftwareEntry:
+      type: object
+      description: |
+        Запись из ключей реестра Uninstall (HKLM 64/32-бит и загруженные HKU).
+        Win32_Product не используется. Записи с SystemComponent=1, без DisplayName и обновления
+        (ParentKeyName / ReleaseType) агент отбрасывает.
+      required: [display_name]
+      properties:
+        display_name:
+          type: string
+          maxLength: 512
+        version:
+          type: string
+          maxLength: 128
+        publisher:
+          type: string
+          maxLength: 256
+        install_date:
+          type: [string, 'null']
+          format: date
+        arch:
+          type: string
+          enum: [x64, x86, arm64, '']
+        scope:
+          type: string
+          enum: [machine, user]
+          description: user — установлено в профиль пользователя (без передачи SID/имени)
+        msi_product_code:
+          type: [string, 'null']
+          format: uuid
+        size_kb:
+          type: [integer, 'null']
+
+    InventoryResponse:
+      type: object
+      required: [changes]
+      properties:
+        changes:
+          type: object
+          required: [software_added, software_removed, software_updated, hardware_changed]
+          properties:
+            software_added:
+              type: integer
+            software_removed:
+              type: integer
+            software_updated:
+              type: integer
+            hardware_changed:
+              type: boolean
+      example:
+        changes: {software_added: 1, software_removed: 0, software_updated: 2, hardware_changed: false}
+
+    TokenRotateResponse:
+      type: object
+      required: [device_token, previous_valid_until]
+      properties:
+        device_token:
+          type: string
+        previous_valid_until:
+          type: string
+          format: date-time
+
+    # -------------------------------------------------------------- Web API
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          maxLength: 128
+        password:
+          type: string
+          format: password
+          maxLength: 256
+
+    CurrentUser:
+      type: object
+      required: [id, username, role]
+      properties:
+        id:
+          type: integer
+          format: int64
+        username:
+          type: string
+        display_name:
+          type: string
+        role:
+          type: string
+          enum: [admin, operator, viewer]
+
+    GroupRef:
+      type: [object, 'null']
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+
+    DeviceSummary:
+      type: object
+      required: [id, hostname, status, online, tags]
+      properties:
+        id:
+          type: integer
+          format: int64
+        hostname:
+          type: string
+        domain:
+          type: [string, 'null']
+        status:
+          $ref: '#/components/schemas/DeviceStatus'
+        online:
+          type: boolean
+          description: Данные приходили не позднее порога online_threshold_s (по умолчанию 180 с)
+        group:
+          $ref: '#/components/schemas/GroupRef'
+        tags:
+          type: array
+          items:
+            type: string
+        os:
+          type: object
+          properties:
+            name:
+              type: string
+            display_version:
+              type: string
+            arch:
+              $ref: '#/components/schemas/Arch'
+        agent_version:
+          type: [string, 'null']
+        last_seen_at:
+          type: [string, 'null']
+          format: date-time
+        last_ip:
+          type: [string, 'null']
+        metrics:
+          type: object
+          properties:
+            cpu_pct:
+              type: [number, 'null']
+            mem_used_pct:
+              type: [number, 'null']
+            min_disk_free_pct:
+              type: [number, 'null']
+        active_alerts:
+          type: object
+          required: [critical, warning]
+          properties:
+            critical:
+              type: integer
+            warning:
+              type: integer
+
+    DeviceListPage:
+      type: object
+      required: [items, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceSummary'
+        next_cursor:
+          type: [string, 'null']
+        total:
+          type: integer
+          description: Количество устройств под текущим фильтром
+      example:
+        items:
+          - id: 42
+            hostname: PC-ACC-012
+            domain: CORP
+            status: active
+            online: true
+            group: {id: 3, name: Бухгалтерия}
+            tags: [office-1]
+            os: {name: Windows 10 Pro, display_version: 22H2, arch: x64}
+            agent_version: 1.0.0
+            last_seen_at: '2026-09-28T09:15:02Z'
+            last_ip: 192.168.10.23
+            metrics: {cpu_pct: 12.4, mem_used_pct: 71.0, min_disk_free_pct: 7.9}
+            active_alerts: {critical: 1, warning: 0}
+        next_cursor: eyJrIjoiUEMtQUNDLTAxMiIsImlkIjo0Mn0
+        total: 97
+
+    DeviceDetails:
+      allOf:
+        - $ref: '#/components/schemas/DeviceSummary'
+        - type: object
+          properties:
+            notes:
+              type: string
+            enrolled_at:
+              type: string
+              format: date-time
+            inventory_at:
+              type: [string, 'null']
+              format: date-time
+            identifiers:
+              type: object
+              properties:
+                machine_guid:
+                  type: [string, 'null']
+                smbios_uuid:
+                  type: [string, 'null']
+                serial_number:
+                  type: [string, 'null']
+            state:
+              type: object
+              properties:
+                boot_time:
+                  type: [string, 'null']
+                  format: date-time
+                logged_on_user:
+                  type: [string, 'null']
+                clock_skew_s:
+                  type: integer
+                agent_uptime_s:
+                  type: [integer, 'null']
+                agent_rss_bytes:
+                  type: [integer, 'null']
+                agent_errors:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/CollectorError'
+            hardware:
+              type: object
+              properties:
+                manufacturer:
+                  type: [string, 'null']
+                model:
+                  type: [string, 'null']
+                bios_vendor:
+                  type: [string, 'null']
+                bios_version:
+                  type: [string, 'null']
+                bios_date:
+                  type: [string, 'null']
+                  format: date
+                cpu_model:
+                  type: [string, 'null']
+                cpu_cores:
+                  type: [integer, 'null']
+                cpu_threads:
+                  type: [integer, 'null']
+                ram_total_bytes:
+                  type: [integer, 'null']
+                ram_modules:
+                  type: array
+                  items:
+                    type: object
+                    additionalProperties: true
+            disks:
+              type: array
+              items:
+                $ref: '#/components/schemas/PhysicalDisk'
+            volumes:
+              type: array
+              items:
+                $ref: '#/components/schemas/Volume'
+            network:
+              type: array
+              items:
+                $ref: '#/components/schemas/NetworkAdapter'
+
+    DevicePatch:
+      type: object
+      minProperties: 1
+      properties:
+        group_id:
+          type: [integer, 'null']
+          format: int64
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+            pattern: '^[^\s,]{1,40}$'
+            description: Тег без пробелов и запятых, до 40 символов
+        notes:
+          type: string
+          maxLength: 4000
+
+    DeviceMetrics:
+      type: object
+      required: [from, to, resolution, host, disks]
+      properties:
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        resolution:
+          type: string
+          enum: [raw, 15m, 1h]
+        host:
+          type: object
+          required: [ts, cpu_pct, cpu_max_pct, mem_used_pct]
+          properties:
+            ts:
+              type: array
+              items:
+                type: string
+                format: date-time
+            cpu_pct:
+              type: array
+              items:
+                type: number
+            cpu_max_pct:
+              type: array
+              items:
+                type: number
+            mem_used_pct:
+              type: array
+              items:
+                type: number
+        disks:
+          type: object
+          description: Ключ — том («C:»)
+          additionalProperties:
+            type: object
+            required: [ts, free_pct, free_bytes]
+            properties:
+              ts:
+                type: array
+                items:
+                  type: string
+                  format: date-time
+              free_pct:
+                type: array
+                items:
+                  type: number
+              free_bytes:
+                type: array
+                items:
+                  type: integer
+                  format: int64
+      example:
+        from: '2026-09-28T08:15:00Z'
+        to: '2026-09-28T09:15:00Z'
+        resolution: raw
+        host:
+          ts: ['2026-09-28T09:13:00Z', '2026-09-28T09:14:00Z', '2026-09-28T09:15:00Z']
+          cpu_pct: [11.2, 12.4, 9.8]
+          cpu_max_pct: [30.5, 38.0, 21.5]
+          mem_used_pct: [70.8, 71.0, 71.0]
+        disks:
+          'C:':
+            ts: ['2026-09-28T09:10:00Z', '2026-09-28T09:15:00Z']
+            free_pct: [7.9, 7.9]
+            free_bytes: [20132659200, 20131610624]
+
+    InstalledSoftware:
+      type: object
+      required: [software_id, name, display_name, version, scope, first_seen_at]
+      properties:
+        software_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+          description: Нормализованное название
+        publisher:
+          type: string
+        display_name:
+          type: string
+        version:
+          type: string
+        arch:
+          type: string
+        scope:
+          type: string
+          enum: [machine, user]
+        install_date:
+          type: [string, 'null']
+          format: date
+        first_seen_at:
+          type: string
+          format: date-time
+        removed_at:
+          type: [string, 'null']
+          format: date-time
+
+    SoftwareCatalogItem:
+      type: object
+      required: [id, name, publisher, device_count, version_count]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        publisher:
+          type: string
+        device_count:
+          type: integer
+        version_count:
+          type: integer
+
+    SoftwareCatalogPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SoftwareCatalogItem'
+        next_cursor:
+          type: [string, 'null']
+
+    SoftwareInstallation:
+      type: object
+      required: [device_id, hostname, version]
+      properties:
+        device_id:
+          type: integer
+          format: int64
+        hostname:
+          type: string
+        group:
+          $ref: '#/components/schemas/GroupRef'
+        display_name:
+          type: string
+        version:
+          type: string
+        arch:
+          type: string
+        install_date:
+          type: [string, 'null']
+          format: date
+        last_seen_at:
+          type: [string, 'null']
+          format: date-time
+
+    AlertMetric:
+      type: string
+      enum: [cpu_pct, mem_used_pct, disk_free_pct, disk_free_bytes, offline]
+
+    AlertRuleInput:
+      type: object
+      description: |
+        Для `offline`: `operator` и `threshold` не задаются, `duration_s` > 0 — порог отсутствия данных.
+        Для остальных метрик условие должно выполняться на всём окне `duration_s`
+        (0 — по последнему значению). `resolve_threshold` задаёт гистерезис закрытия.
+        `volume_pattern` обязателен для `disk_*` (`C:` или `*` — все фиксированные тома).
+      required: [name, severity, metric]
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        enabled:
+          type: boolean
+          default: true
+        severity:
+          $ref: '#/components/schemas/Severity'
+        metric:
+          $ref: '#/components/schemas/AlertMetric'
+        operator:
+          type: [string, 'null']
+          enum: ['>', '>=', '<', '<=', null]
+        threshold:
+          type: [number, 'null']
+        resolve_threshold:
+          type: [number, 'null']
+        duration_s:
+          type: integer
+          minimum: 0
+          maximum: 86400
+          default: 0
+        volume_pattern:
+          type: [string, 'null']
+          pattern: '^([A-Z]:|\*)$'
+        scope:
+          type: object
+          properties:
+            group_id:
+              type: [integer, 'null']
+              format: int64
+            tag:
+              type: [string, 'null']
+        channel_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+        renotify_interval_s:
+          type: [integer, 'null']
+          minimum: 300
+
+    AlertRule:
+      allOf:
+        - $ref: '#/components/schemas/AlertRuleInput'
+        - type: object
+          required: [id, created_at, updated_at]
+          properties:
+            id:
+              type: integer
+              format: int64
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
+
+    Alert:
+      type: object
+      required: [id, device, dimension, state, severity, message, fired_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        rule:
+          type: [object, 'null']
+          description: null — правило удалено (история сохраняется)
+          properties:
+            id:
+              type: integer
+              format: int64
+            name:
+              type: string
+        device:
+          type: object
+          required: [id, hostname]
+          properties:
+            id:
+              type: integer
+              format: int64
+            hostname:
+              type: string
+        dimension:
+          type: string
+          description: Том для дисковых правил, иначе пустая строка
+        state:
+          type: string
+          enum: [firing, resolved]
+        severity:
+          $ref: '#/components/schemas/Severity'
+        value:
+          type: [number, 'null']
+        last_value:
+          type: [number, 'null']
+        message:
+          type: string
+        fired_at:
+          type: string
+          format: date-time
+        resolved_at:
+          type: [string, 'null']
+          format: date-time
+        acknowledged_by:
+          type: [object, 'null']
+          properties:
+            id:
+              type: integer
+              format: int64
+            username:
+              type: string
+        acknowledged_at:
+          type: [string, 'null']
+          format: date-time
+
+    AlertPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Alert'
+        next_cursor:
+          type: [string, 'null']
+
+    EmailChannelConfig:
+      type: object
+      required: [to]
+      additionalProperties: false
+      properties:
+        to:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            type: string
+            format: email
+
+    WebhookChannelConfig:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          format: uri
+          pattern: '^https://'
+        timeout_s:
+          type: integer
+          minimum: 1
+          maximum: 30
+          default: 10
+
+    NotificationChannelInput:
+      type: object
+      required: [name, type, config]
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        type:
+          type: string
+          enum: [email, webhook]
+        enabled:
+          type: boolean
+          default: true
+        min_severity:
+          $ref: '#/components/schemas/Severity'
+        config:
+          oneOf:
+            - $ref: '#/components/schemas/EmailChannelConfig'
+            - $ref: '#/components/schemas/WebhookChannelConfig'
+        secret:
+          type: string
+          writeOnly: true
+          minLength: 32
+          description: Секрет HMAC для webhook; хранится зашифрованным и никогда не возвращается
+
+    NotificationChannel:
+      type: object
+      required: [id, name, type, enabled, min_severity, config, has_secret]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        type:
+          type: string
+          enum: [email, webhook]
+        enabled:
+          type: boolean
+        min_severity:
+          $ref: '#/components/schemas/Severity'
+        config:
+          oneOf:
+            - $ref: '#/components/schemas/EmailChannelConfig'
+            - $ref: '#/components/schemas/WebhookChannelConfig'
+        has_secret:
+          type: boolean
+
+    EnrollmentTokenInput:
+      type: object
+      required: [name, expires_in_days]
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        group_id:
+          type: [integer, 'null']
+          format: int64
+          description: Группа, в которую попадут новые устройства
+        auto_approve:
+          type: boolean
+          default: true
+        max_uses:
+          type: [integer, 'null']
+          minimum: 1
+        expires_in_days:
+          type: integer
+          minimum: 1
+          maximum: 365
+
+    EnrollmentToken:
+      type: object
+      required: [id, name, token_prefix, auto_approve, used_count, expires_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        token_prefix:
+          type: string
+        group_id:
+          type: [integer, 'null']
+          format: int64
+        auto_approve:
+          type: boolean
+        max_uses:
+          type: [integer, 'null']
+        used_count:
+          type: integer
+        expires_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    EnrollmentTokenCreated:
+      allOf:
+        - $ref: '#/components/schemas/EnrollmentToken'
+        - type: object
+          required: [token, install_command]
+          properties:
+            token:
+              type: string
+              description: Полное значение — показывается один раз
+            install_command:
+              type: string
+              description: Готовая команда тихой установки агента
+      example:
+        id: 7
+        name: Бухгалтерия, волна 1
+        token_prefix: imenr_7Hk2
+        group_id: 3
+        auto_approve: true
+        max_uses: 40
+        used_count: 0
+        expires_at: '2026-10-28T09:00:00Z'
+        created_at: '2026-09-28T09:00:00Z'
+        token: imenr_7Hk2EXAMPLEonlyNotARealToken4xQp
+        install_command: >-
+          msiexec /i InvMonAgent-1.0.0-x64.msi /qn SERVER_URL=https://invmon.corp.local:8443
+          ENROLL_TOKEN=imenr_7Hk2EXAMPLEonlyNotARealToken4xQp CA_FILE=\\corp.local\NETLOGON\invmon\ca.pem
+
+    AuditEvent:
+      type: object
+      required: [id, ts, actor_type, actor_name, action, result]
+      properties:
+        id:
+          type: integer
+          format: int64
+        ts:
+          type: string
+          format: date-time
+        actor_type:
+          type: string
+          enum: [user, agent, system]
+        actor_id:
+          type: [integer, 'null']
+          format: int64
+        actor_name:
+          type: string
+        action:
+          type: string
+          examples: [user.login, alert_rule.update, device.revoke, agent.enroll, report.export]
+        object_type:
+          type: [string, 'null']
+        object_id:
+          type: [string, 'null']
+        result:
+          type: string
+          enum: [success, failure]
+        ip:
+          type: [string, 'null']
+        details:
+          type: object
+          additionalProperties: true
+
+    AuditPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEvent'
+        next_cursor:
+          type: [string, 'null']
+
+    WebhookEvent:
+      type: object
+      required: [event_id, event, sent_at, alert, device]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        event:
+          type: string
+          enum: [alert.firing, alert.resolved, alert.reminder, channel.test]
+        sent_at:
+          type: string
+          format: date-time
+        alert:
+          type: object
+          required: [id, severity, state, metric, message, fired_at]
+          properties:
+            id:
+              type: integer
+              format: int64
+            rule:
+              type: object
+              properties:
+                id:
+                  type: integer
+                  format: int64
+                name:
+                  type: string
+            severity:
+              $ref: '#/components/schemas/Severity'
+            state:
+              type: string
+              enum: [firing, resolved]
+            metric:
+              $ref: '#/components/schemas/AlertMetric'
+            dimension:
+              type: string
+            operator:
+              type: [string, 'null']
+            threshold:
+              type: [number, 'null']
+            value:
+              type: [number, 'null']
+            message:
+              type: string
+            fired_at:
+              type: string
+              format: date-time
+            resolved_at:
+              type: [string, 'null']
+              format: date-time
+        device:
+          type: object
+          required: [id, hostname, url]
+          properties:
+            id:
+              type: integer
+              format: int64
+            hostname:
+              type: string
+            group:
+              type: [string, 'null']
+            ip:
+              type: [string, 'null']
+            url:
+              type: string
+              format: uri
+      example:
+        event_id: 8a6b7f0e-4a0b-4b8e-9d3e-1d7c2f7f9a10
+        event: alert.firing
+        sent_at: '2026-09-28T09:16:00Z'
+        alert:
+          id: 1187
+          rule: {id: 1, name: Мало места на системном диске}
+          severity: critical
+          state: firing
+          metric: disk_free_pct
+          dimension: 'C:'
+          operator: '<'
+          threshold: 10
+          value: 7.9
+          message: 'PC-ACC-012: свободно на C: 7.9% (порог < 10%)'
+          fired_at: '2026-09-28T09:16:00Z'
+          resolved_at: null
+        device:
+          id: 42
+          hostname: PC-ACC-012
+          group: Бухгалтерия
+          ip: 192.168.10.23
+          url: https://invmon.corp.local/devices/42
