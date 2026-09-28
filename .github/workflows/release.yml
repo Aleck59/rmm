@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (e.g. v0.1.0); artifacts only, no GitHub Release"
+        required: true
+        default: "v0.0.0-manual"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          check-latest: true
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Optional Windows 7/8.1 agent toolchain (go-legacy-win7). Best-effort:
+      # if the download fails, standard (Windows 10+) builds still ship and the
+      # -win7 packages are simply omitted. Win7 support is validated on real
+      # VMs as the Stage 0 acceptance test.
+      - name: Set up go-legacy-win7 (best-effort)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WIN7_RELEASE: "go-legacy-win7-1.27.1-1"
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/go-win7"
+          mkdir -p "$dir"
+          gh release download "$WIN7_RELEASE" \
+            --repo thongtech/go-legacy-win7 \
+            --pattern '*linux-amd64*' \
+            --dir "$dir"
+          tar -xzf "$dir"/*linux-amd64* -C "$dir"
+          echo "INVMON_GO_WIN7=$dir/go/bin/go" >> "$GITHUB_ENV"
+
+      - name: Build & package
+        run: VERSION="${{ steps.ver.outputs.version }}" bash scripts/build-dist.sh
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: invmon-${{ steps.ver.outputs.version }}
+          path: dist/*
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: InvMon ${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ contains(steps.ver.outputs.version, '-') }}
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/SHA256SUMS

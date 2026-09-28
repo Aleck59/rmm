@@ -1,0 +1,22 @@
+# InvMon agent configuration (Stage 0).
+# install.ps1 writes C:\ProgramData\InvMon\Agent\agent.yaml from these values.
+
+server_url: 'https://invmon.corp.local:8443'
+
+# CA certificate (PEM) used to verify the server. The agent trusts only this
+# CA, not the Windows certificate store.
+ca_file: 'C:\ProgramData\InvMon\Agent\ca.pem'
+
+# Optional public-key pinning (base64 SHA-256 of the server SPKI).
+# pin_sha256:
+#   - '...'
+
+# Enrollment token (imenr_...). Used once on first launch, then removed from
+# this file by the agent.
+enroll_token: ''
+
+# '' = direct connection; 'system' = use the WinHTTP system proxy.
+proxy: ''
+
+# debug | info | warn | error
+log_level: info

@@ -4,16 +4,44 @@
 
 Система только наблюдает за устройствами, принадлежащими организации: агент не принимает команд, не открывает входящих портов и не собирает пользовательские данные.
 
-**Статус:** проектирование MVP (до 100 ПК).
+**Статус:** этап 0 — каркас репозитория и CI/CD с релизами. Собираются сервер,
+агент и веб-интерфейс; сборка сервера отдаёт заглушку SPA и эндпоинты
+`/healthz`, `/readyz`, `/version`. Приём данных от агентов, база данных и
+веб-API добавляются на следующих этапах (см. дорожную карту в architecture.md).
 
 ## Документация
 
 | Документ | Содержание |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | архитектура, стек, агент, сервер, БД, API, безопасность, развёртывание, план MVP |
+| [docs/development.md](docs/development.md) | сборка, запуск, проверки, CI/CD и релизы |
 | [docs/db/schema.sql](docs/db/schema.sql) | схема PostgreSQL |
 | [docs/db/verify.sql](docs/db/verify.sql) | исполняемая проверка схемы и SQL-примеров из документа |
 | [docs/api/openapi.yaml](docs/api/openapi.yaml) | контракт API (OpenAPI 3.1): агент и веб-интерфейс |
+
+## Сборка и запуск
+
+```sh
+make web       # собрать SPA в internal/webui/dist (Vite)
+make build     # собрать bin/invmon-server и bin/invmon-agent
+./bin/invmon-server run --addr :8080     # затем открыть http://localhost:8080/
+
+make dist      # кросс-сборка и упаковка релизных артефактов в dist/
+```
+
+Полный список команд — `make help`; подробности — [docs/development.md](docs/development.md).
+
+## Релизы
+
+Тег `vX.Y.Z` запускает сборку и публикует GitHub Release с установочными
+пакетами:
+
+- `invmon-server-<ver>-windows-<arch>.zip` — сервер + `install.ps1` (регистрация службы);
+- `invmon-agent-<ver>-windows-<arch>.zip` — агент + `install.ps1`; сборки `-win7` для Windows 7/8.1;
+- `invmon-server-<ver>-linux-amd64.tar.gz` и `SHA256SUMS`.
+
+Установщики этапа 0 — ZIP со службой Windows и скриптом установки; MSI и подпись
+кода — этап 4.
 
 ## Ключевые решения
 

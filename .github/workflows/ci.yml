@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.24.x"
+
+jobs:
+  go:
+    name: Go build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: Test (race)
+        run: go test -race ./...
+      - name: Cross-compile all targets
+        run: |
+          set -euo pipefail
+          for t in windows/amd64 windows/386 windows/arm64 linux/amd64 linux/arm64; do
+            echo "== $t =="
+            CGO_ENABLED=0 GOOS="${t%/*}" GOARCH="${t#*/}" go build ./...
+          done
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - name: Install golangci-lint v2.5.0
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.5.0
+      - name: Lint
+        run: "$(go env GOPATH)/bin/golangci-lint run"
+
+  web:
+    name: Web SPA
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm build
+
+  openapi:
+    name: OpenAPI lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npx --yes @redocly/cli@latest lint docs/api/openapi.yaml
+
+  db:
+    name: DB schema verify
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Run schema verification
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -c "CREATE DATABASE invmon_verify;"
+          psql -h localhost -U postgres -d invmon_verify -X -q -v ON_ERROR_STOP=1 -f docs/db/verify.sql
+
+  vulncheck:
+    name: govulncheck (informational)
+    runs-on: ubuntu-latest
+    # Non-blocking: govulncheck reports standard-library advisories whose fixes
+    # may land in a Go patch newer than the one available here. Keeping the
+    # toolchain current is how we clear them; a finding must not block merges.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

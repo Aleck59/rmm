@@ -1,0 +1,22 @@
+# Build output
+/bin/
+/dist/
+
+# Built SPA assets — committed placeholder index.html stays; real build is
+# produced by CI (and locally via `make web`) and must not be committed.
+/internal/webui/dist/assets/
+
+# Go
+*.exe
+*.test
+*.out
+coverage.*
+
+# Node (web/ has its own .gitignore too)
+node_modules/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
