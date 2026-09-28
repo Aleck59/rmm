@@ -54,23 +54,31 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          # Discover the newest go-legacy-win7 release and its linux-amd64
-          # toolchain, then verify the binary before exporting it. If anything
-          # fails, this step is skipped (continue-on-error) and only the
-          # standard Windows 10+ agent builds ship. A future hardening step can
-          # pin the version and check a published checksum.
+          set -uo pipefail
+          # Fetch the newest go-legacy-win7 toolchain (linux-amd64) and verify
+          # the binary before exporting it. This reads a third-party repo, so it
+          # needs the runner to have outbound access to github.com releases and
+          # a token allowed to read public repos — not guaranteed on locked-down
+          # runners. On any failure the step is skipped (continue-on-error) and
+          # only the standard Windows 10+ agent builds ship; Windows 7/8.1 is
+          # validated on real VMs (see the roadmap). A future hardening step can
+          # pin the version and verify a published checksum, or mirror the
+          # toolchain in an internal artifact store.
           dir="$RUNNER_TEMP/go-win7"
           mkdir -p "$dir"
-          url="$(gh api repos/thongtech/go-legacy-win7/releases/latest \
-            --jq '.assets[].browser_download_url | select(test("linux-amd64"))' | head -n1)"
-          if [ -z "$url" ]; then echo "no linux-amd64 asset found"; exit 1; fi
+          if ! resp="$(gh api repos/thongtech/go-legacy-win7/releases/latest 2>"$dir/err.txt")"; then
+            echo "cannot read go-legacy-win7 releases (external-repo access may be restricted on this runner):"
+            cat "$dir/err.txt"
+            exit 1
+          fi
+          url="$(printf '%s' "$resp" | jq -r '.assets[].browser_download_url | select(test("linux-amd64"))' | head -n1)"
+          if [ -z "$url" ]; then echo "no linux-amd64 asset in the latest release"; exit 1; fi
           echo "downloading $url"
-          curl -fsSL "$url" -o "$dir/go-win7.tar.gz"
-          tar -xzf "$dir/go-win7.tar.gz" -C "$dir"
+          curl -fsSL "$url" -o "$dir/go-win7.tar.gz" || { echo "download failed"; exit 1; }
+          tar -xzf "$dir/go-win7.tar.gz" -C "$dir" || { echo "extract failed"; exit 1; }
           gobin="$(find "$dir" -type f -path '*/bin/go' | head -n1)"
           if [ -z "$gobin" ]; then echo "go binary not found in archive"; exit 1; fi
-          "$gobin" version
+          "$gobin" version || { echo "toolchain not runnable"; exit 1; }
           echo "INVMON_GO_WIN7=$gobin" >> "$GITHUB_ENV"
 
       - name: Build & package
