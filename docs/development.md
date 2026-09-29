@@ -1,18 +1,19 @@
 # Разработка InvMon
 
-Этот документ описывает каркас репозитория (этап 0): как собрать, запустить и
-проверить сервер, агент и веб-интерфейс, и как устроен CI/CD с релизами.
+Этот документ описывает, как собрать, запустить и проверить сервер, агент и
+веб-интерфейс, и как устроен CI/CD с релизами. Реализовано: этап 0 (каркас, CI/CD)
+и этап 1 (регистрация агентов и приём метрик).
 Архитектура целиком — в [architecture.md](architecture.md).
 
 ## Требования
 
 | Инструмент | Версия | Зачем |
 |---|---|---|
-| Go | ≥ 1.24 | сервер и агент |
+| Go | ≥ 1.26 (CI — 1.27) | сервер и агент |
 | Node.js | 22 | сборка SPA |
 | pnpm | 10 | пакеты SPA |
-| PostgreSQL client (`psql`) | 16+ | проверка схемы БД |
-| golangci-lint | 2.5.x | линтер Go |
+| PostgreSQL | 16+ (прод — 17/18) | БД сервера, интеграционные тесты |
+| golangci-lint | 2.14.x | линтер Go |
 
 Для сборки агента под Windows 7/8.1 используется форк
 [go-legacy-win7](https://github.com/thongtech/go-legacy-win7) (см. раздел о релизах).
@@ -25,11 +26,17 @@ cmd/invmon-agent/      точка входа агента  (run | version | serv
 internal/buildinfo/    версия и метаданные сборки (задаются через -ldflags)
 internal/cliutil/      общие помощники CLI: логирование, версия, служба
 internal/winservice/   установка и супервизия службы Windows (+заглушка для не-Windows)
-internal/server/       HTTP-сервер: /healthz, /readyz, /version, отдача SPA
-internal/agent/        каркас агента (конфиг, цикл; сбор данных — этап 1)
+internal/server/       процесс сервера: веб-листенер (/healthz, /readyz, /version, SPA),
+                       агентский листенер, обслуживание партиций
+internal/agentapi/     Agent API: регистрация, приём метрик, конфигурация, ротация токена
+internal/store/        слой PostgreSQL (pgx) и встроенные миграции (store/migrations/)
+internal/protocol/     типы протокола агент ↔ сервер (зеркало OpenAPI)
+internal/tokens/       генерация и хэширование токенов (imenr_ / imagt_)
+internal/ratelimit/    ограничение частоты запросов
+internal/agent/        агент: регистрация, DPAPI-состояние, сборщики, отправка
 internal/webui/        встраивание собранного SPA (go:embed); dist/index.html — заглушка
 web/                   исходники SPA (Vite + React + TypeScript)
-migrations/            миграции БД (пусто; первая миграция = docs/db/schema.sql на этапе 1)
+migrations/            указатель на internal/store/migrations
 packaging/windows/     шаблоны установщиков: install.ps1, uninstall.ps1, конфиги
 scripts/build-dist.sh  кросс-сборка и упаковка релизных артефактов
 docs/                  архитектура, схема БД, OpenAPI, этот файл
@@ -74,6 +81,47 @@ make run-server
 cd web && pnpm dev
 ```
 
+## Этап 1: регистрация агентов и приём метрик
+
+Нужен PostgreSQL. Сервер применяет миграции при старте (или `migrate`).
+
+```sh
+export INVMON_DATABASE_URL='postgres://postgres@127.0.0.1:5432/invmon?sslmode=disable'
+createdb invmon
+
+./bin/invmon-server migrate
+./bin/invmon-server run --addr :8080 --agent-addr :8443     # веб :8080, агенты :8443
+
+# токен регистрации (показывается один раз; в БД — только SHA-256)
+./bin/invmon-server token create --name "Пилот" --days 7 --max-uses 20 [--manual-approve]
+
+# агент (на машине разработчика — синтетический сборщик; на Windows — реальный)
+cat > agent.yaml <<YAML
+server_url: 'http://127.0.0.1:8443'
+enroll_token: 'imenr_...'
+allow_insecure: true        # только для разработки: http без TLS
+YAML
+./bin/invmon-agent run --config ./agent.yaml
+```
+
+После регистрации агент сохраняет идентичность в `state.bin` рядом с конфигом (на Windows —
+под DPAPI) и заменяет `enroll_token` в `agent.yaml` пустым значением. Одобрить устройство
+(при `--manual-approve`) или отозвать его:
+
+```sh
+./bin/invmon-server device set-status --id 1 --status active     # или revoked / retired
+```
+
+Что проверить в БД: `devices`, `device_state` (последние значения), `metrics_host`,
+`metrics_disk` (партиции по суткам), `audit_log` (`enrollment_token.create`, `agent.enroll`).
+
+Интеграционные тесты (хранилище, Agent API, сквозной тест агента) создают и удаляют
+временные базы; без переменной окружения они пропускаются:
+
+```sh
+INVMON_TEST_DATABASE_URL='postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable' go test -race ./...
+```
+
 ## Проверки (как в CI)
 
 ```sh
@@ -115,10 +163,10 @@ Workflow `.github/workflows/ci.yml` (push в `main` и `claude/**`, PR в `main`
 | Задача | Что делает |
 |---|---|
 | `go` | `gofmt`, `go vet`, `go test -race`, кросс-компиляция всех целей |
-| `lint` | golangci-lint 2.5.0 |
+| `lint` | golangci-lint 2.14.0 |
 | `web` | `pnpm install --frozen-lockfile`, lint, typecheck, build |
 | `openapi` | `redocly lint docs/api/openapi.yaml` |
-| `db` | поднимает PostgreSQL 16 и прогоняет `docs/db/verify.sql` |
+| `db` | PostgreSQL 16: сверка `0001_core.sql` с `docs/db/schema.sql`, `verify.sql`, интеграционные тесты Go |
 | `vulncheck` | govulncheck (информационно, не блокирует) |
 
 ## Релизы

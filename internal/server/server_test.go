@@ -8,10 +8,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Aleck59/rmm/internal/store/storetest"
 )
 
 func TestHealthz(t *testing.T) {
-	s, err := New(DefaultConfig(), discardLogger())
+	s, err := New(DefaultConfig(), discardLogger(), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -29,7 +31,7 @@ func TestHealthz(t *testing.T) {
 }
 
 func TestVersion(t *testing.T) {
-	s, err := New(DefaultConfig(), discardLogger())
+	s, err := New(DefaultConfig(), discardLogger(), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -47,20 +49,33 @@ func TestVersion(t *testing.T) {
 	}
 }
 
-func TestReadyz(t *testing.T) {
-	s, err := New(DefaultConfig(), discardLogger())
+func TestReadyzWithoutDatabase(t *testing.T) {
+	s, err := New(DefaultConfig(), discardLogger(), nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rr := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 when no database is configured", rr.Code)
+	}
+}
+
+func TestReadyzWithDatabase(t *testing.T) {
+	st, _ := storetest.New(t)
+	s, err := New(DefaultConfig(), discardLogger(), st)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	rr := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 	if rr.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rr.Code)
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
 	}
 }
 
 func TestAPIStubNotImplemented(t *testing.T) {
-	s, err := New(DefaultConfig(), discardLogger())
+	s, err := New(DefaultConfig(), discardLogger(), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -72,7 +87,7 @@ func TestAPIStubNotImplemented(t *testing.T) {
 }
 
 func TestSPAFallback(t *testing.T) {
-	s, err := New(DefaultConfig(), discardLogger())
+	s, err := New(DefaultConfig(), discardLogger(), nil)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

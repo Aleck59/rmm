@@ -43,10 +43,15 @@ fi
 # build_bin <goos> <goarch> <cmd> <output-path> [go-binary]
 build_bin() {
     local goos="$1" goarch="$2" cmd="$3" out="$4" gobin="${5:-go}"
-    local note=""
-    [[ "${gobin}" != "go" ]] && note=" (win7 toolchain)"
+    local note="" toolchain="${GOTOOLCHAIN:-auto}"
+    if [[ "${gobin}" != "go" ]]; then
+        note=" (win7 toolchain)"
+        # Never let the fork switch to an upstream toolchain, which would
+        # silently drop Windows 7 support from the binary.
+        toolchain=local
+    fi
     echo ">> build ${cmd} ${goos}/${goarch}${note}"
-    CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" \
+    CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" GOTOOLCHAIN="${toolchain}" \
         "${gobin}" build -trimpath -ldflags "${LDFLAGS}" -o "${out}" "./cmd/${cmd}"
 }
 

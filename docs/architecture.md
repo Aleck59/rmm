@@ -155,7 +155,7 @@
 | Слой | Выбор |
 |---|---|
 | Агент | **Go**. Сборка для Windows 10/11 — актуальным официальным тулчейном (1.27); для Windows 7/8.1 — форком [go-legacy-win7](https://github.com/thongtech/go-legacy-win7) той же версии (3.2) |
-| Сервер | **Go**: `net/http` + chi, pgx v5, sqlc, goose (миграции), River (фоновые задачи), oapi-codegen, `log/slog`, go-mail |
+| Сервер | **Go**: `net/http` + chi, pgx v5, sqlc, встроенный мигратор (версионные SQL-файлы), River (фоновые задачи), oapi-codegen, `log/slog`, go-mail |
 | БД | **PostgreSQL 17/18**; расширения `pg_trgm` и `citext` из стандартной поставки |
 | Очереди | **Отдельного брокера нет**: River (очередь задач в PostgreSQL) + transactional outbox; буфер при недоступности сервера — на стороне агента (3.3) |
 | Frontend | **React + TypeScript + Vite**; Mantine (компоненты), TanStack Query и TanStack Table, Apache ECharts; типы API — `openapi-typescript` |
@@ -203,7 +203,7 @@ internal/agent/       коллекторы (metrics, wmi, registry), буфер,
 internal/server/      agentapi, webapi, ingest, inventory, alerting, notify, jobs, auth, audit, store
 internal/protocol/    типы, сгенерированные из docs/api/openapi.yaml
 web/                  React SPA (встраивается в бинарник сервера)
-migrations/           миграции goose (первая — docs/db/schema.sql)
+internal/store/migrations/  версионные SQL-миграции (0001_core = docs/db/schema.sql)
 packaging/agent-msi/  WiX-проект агента
 docs/                 этот документ, схема БД, OpenAPI
 ```
@@ -352,7 +352,7 @@ func agentTLSConfig(caPEM []byte, serverName string, pins [][]byte) (*tls.Config
 | `notify` | email (SMTP), webhook (HMAC), шаблоны, журнал доставки |
 | `jobs` | регистрация задач River и расписаний |
 | `audit` | запись событий аудита, вырезание секретов |
-| `store` | запросы (sqlc), миграции (goose, встроены в бинарник) |
+| `store` | запросы, миграции (встроенный мигратор, SQL-файлы в бинарнике) |
 
 ### 5.2. Два порта
 
@@ -609,7 +609,7 @@ users ─< sessions      audit_log (партиции по месяцам, тол
 
 ### 6.5. Роли и права
 
-- `invmon_owner` — владелец схемы. Под ним применяются миграции (goose при старте сервера, под advisory-lock); для рабочих запросов не используется.
+- `invmon_owner` — владелец схемы. Под ним применяются миграции (встроенный мигратор при старте сервера, под advisory-lock); для рабочих запросов не используется.
 - `invmon_app` — рабочая роль сервера: `SELECT/INSERT/UPDATE/DELETE`, на `audit_log` — только `SELECT/INSERT`; партиции — только через `SECURITY DEFINER`-функции.
 - `verify.sql` проверяет: под рабочей ролью `UPDATE`, `DELETE` и `TRUNCATE` журнала аудита отклоняются правами, под владельцем `UPDATE` и `DELETE` — триггером; создать партицию напрямую рабочая роль не может.
 - Настоящая неизменяемость аудита — копия во внешнем SIEM или syslog (v1.1).
@@ -982,7 +982,7 @@ msiexec /i InvMonAgent-1.0.0-x64.msi /qn /l*v "%TEMP%\invmon-agent.log" ^
 
 ### 9.6. Обновления
 
-- **Сервер:** резервная копия → остановка службы → замена файлов → запуск. Миграции применяются при старте автоматически (goose, под advisory-lock, каждая в своей транзакции). Откат — восстановление копии и предыдущих бинарников: миграции только вперёд.
+- **Сервер:** резервная копия → остановка службы → замена файлов → запуск. Миграции применяются при старте автоматически (встроенный мигратор, под advisory-lock, каждая в своей транзакции). Откат — восстановление копии и предыдущих бинарников: миграции только вперёд.
 - **Агенты:** новая версия MSI (`MajorUpgrade`) тем же способом, что и установка. UI показывает версии агентов и устаревшие. Сервер принимает агентов текущей и предыдущей версии API.
 - **Автообновления агентов нет** (1.2). Если оно понадобится — только пакеты, подписанные ключом организации, с проверкой подписи агентом и включением через политику.
 

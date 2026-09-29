@@ -66,7 +66,7 @@ func cmdRun(args []string) error {
 		return err
 	}
 	log := cliutil.NewLogger(cfg.LogLevel)
-	a := agent.New(cfg, log)
+	a := agent.New(cfg, log, agent.Options{ConfigPath: *configPath})
 	return cliutil.RunSupervised(serviceName, func(ctx context.Context) error {
 		return a.Run(ctx)
 	})
