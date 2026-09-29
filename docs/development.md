@@ -39,7 +39,8 @@ web/                   исходники SPA (Vite + React + TypeScript)
 migrations/            указатель на internal/store/migrations
 packaging/windows/     шаблоны установщиков: install.ps1, uninstall.ps1, конфиги
 scripts/build-dist.sh  кросс-сборка и упаковка релизных артефактов
-docs/                  архитектура, схема БД, OpenAPI, этот файл
+docs/                  архитектура, схема БД, OpenAPI, этот файл;
+                       execution.md + db/schema_execution.sql — проект модуля выполнения (v2.0)
 .github/workflows/     CI и релизы
 ```
 

@@ -14,8 +14,16 @@ info:
     * **Web API** — `/api/v1/*`, порт 443, доступен только из сети администраторов.
       Аутентификация: сессионная cookie `__Host-invmon_session` (HttpOnly, Secure, SameSite=Strict).
 
-    Агент **не принимает команд**: ответы сервера содержат только декларативную конфигурацию
+    В MVP агент **не принимает команд**: ответы сервера содержат только декларативную конфигурацию
     сбора данных из фиксированного набора полей.
+
+    **Модуль выполнения скриптов и управления ПО (v2.0, проект — `docs/execution.md`)** добавляет
+    теги `scripts`, `signing`, `script-runs`, `packages`, `deployments`, `execution-admin` и эндпоинты
+    агента `/api/agent/v1/tasks/*`. Агент сам забирает задачи (pull, без входящих портов) и выполняет
+    только код и установщики с двумя подписями (автор и согласующий) ключами из списка доверенных,
+    заданного локальной политикой ПК (GPO). По умолчанию выполнение на ПК выключено. Операциям
+    модуля нужно явное разрешение из расширения `x-required-permission` в области группы устройств;
+    роль из `x-required-role` такого права не даёт.
 
     Общие соглашения:
     * время — RFC 3339 в UTC; размеры — в байтах (int64); проценты — 0…100;
@@ -46,6 +54,18 @@ tags:
     description: Правила алертов, алерты, каналы уведомлений
   - name: admin
     description: Токены регистрации, аудит
+  - name: scripts
+    description: Библиотека скриптов PowerShell / CMD и их версии (модуль выполнения, v2.0)
+  - name: signing
+    description: Подписи автора и согласующего — версии, запуски, развёртывания (v2.0)
+  - name: script-runs
+    description: Запуски скриптов на ПК и отчёты о выполнении (v2.0)
+  - name: packages
+    description: Каталог ПО для установки — MSI, EXE, установка скриптом (v2.0)
+  - name: deployments
+    description: Установка, обновление, удаление ПО; политики желаемого состояния (v2.0)
+  - name: execution-admin
+    description: Стоп-кран, ключи подписантов, права модуля выполнения (v2.0)
 
 security:
   - session: []
@@ -231,6 +251,188 @@ paths:
         '403':
           $ref: '#/components/responses/DeviceForbidden'
 
+  # ---------------------------------------------------------------------------
+  # Agent API — модуль выполнения (v2.0, проект; docs/execution.md)
+  # ---------------------------------------------------------------------------
+  /api/agent/v1/tasks/claim:
+    servers:
+      - url: https://invmon.corp.local:8443
+        description: Agent API (порт 8443)
+    post:
+      tags: [agent]
+      operationId: agentClaimTasks
+      summary: Забрать задачи (pull)
+      description: |
+        Агент вызывает, когда в ответе на метрики `tasks_pending = true` (задержка — не больше
+        интервала отправки метрик, по умолчанию 60 с), и не вызывает, если выполнение выключено
+        локальной политикой ПК. Сервер выдаёт задачи атомарно (`claim_agent_tasks`, `FOR UPDATE SKIP
+        LOCKED`) с учётом стоп-крана, окна запуска, колец и окна обслуживания развёртываний.
+        Выданная задача получает аренду: до `lease_expires_at` агент должен подтвердить старт
+        событием `started`, иначе задача вернётся в очередь.
+
+        До выполнения агент **сам** проверяет задачу, не доверяя серверу: подписи автора и
+        согласующего над `artifact.manifest` (разные люди, ключи из локального списка доверенных),
+        `org` и тип манифеста, схему параметров, ОС и версию PowerShell; для согласованного запуска —
+        подписи `run_approval` и то, что ПК есть в его списке. Любое несоответствие — итог `rejected`
+        с `error_code`, без запуска.
+      security:
+        - deviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskClaimRequest'
+      responses:
+        '200':
+          description: Выданные задачи (возможно, пустой список)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskClaimResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/DeviceForbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/agent/v1/tasks/{taskId}/events:
+    servers:
+      - url: https://invmon.corp.local:8443
+        description: Agent API (порт 8443)
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [agent]
+      operationId: agentPostTaskEvent
+      summary: Старт, фрагмент вывода или heartbeat задачи
+      description: |
+        **Двухфазный старт:** агент запускает процесс только после ответа 200 на событие `started`.
+        Ответ 409 с `code: task_canceled` означает, что задачу отменили, пока она была в пути, —
+        запускать нельзя.
+
+        Во время выполнения агент отправляет фрагменты вывода (не чаще раза в 5 с или по 64 КиБ) и
+        heartbeat не реже раза в 10 с. `seq` монотонен: повтор события с уже принятым `seq`
+        игнорируется, поэтому повторная отправка после сбоя связи безопасна. Ответ сообщает, запрошена
+        ли отмена: тогда агент завершает Job Object задачи и отправляет итог `canceled`.
+      security:
+        - deviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskEventInput'
+      responses:
+        '200':
+          description: Событие принято
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskEventResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/DeviceForbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  /api/agent/v1/tasks/{taskId}/result:
+    servers:
+      - url: https://invmon.corp.local:8443
+        description: Agent API (порт 8443)
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    post:
+      tags: [agent]
+      operationId: agentPostTaskResult
+      summary: Итог выполнения задачи
+      description: |
+        Идемпотентно: повтор того же итога — 204; другой итог для уже завершённой задачи — 409.
+        Итог принимается и после того, как сервер пометил задачу `lost` (агент был офлайн).
+        Агент хранит итог в локальном журнале задач до подтверждения сервером.
+      security:
+        - deviceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskResultInput'
+      responses:
+        '204':
+          description: Итог принят
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/DeviceForbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/agent/v1/packages/{sha256}:
+    servers:
+      - url: https://invmon.corp.local:8443
+        description: Agent API (порт 8443)
+    parameters:
+      - name: sha256
+        in: path
+        required: true
+        description: SHA-256 установщика из подписанного манифеста пакета
+        schema:
+          $ref: '#/components/schemas/Sha256Hex'
+    get:
+      tags: [agent]
+      operationId: agentDownloadPackage
+      summary: Скачать установщик
+      description: |
+        Отдаётся только устройству, у которого есть выданная (`dispatched`/`running`) задача с этим
+        установщиком. Поддерживается докачка (`Range`). Агент сверяет SHA-256 и размер с подписанным
+        манифестом, держит файл открытым без права записи для других процессов до конца установки
+        и проверяет подпись издателя (Authenticode), если её требует манифест.
+      security:
+        - deviceToken: []
+      parameters:
+        - name: Range
+          in: header
+          required: false
+          schema:
+            type: string
+          example: bytes=1048576-
+      responses:
+        '200':
+          description: Файл целиком
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                contentMediaType: application/octet-stream
+        '206':
+          description: Запрошенный диапазон
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                contentMediaType: application/octet-stream
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/DeviceForbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   # ===========================================================================
   # Web API — аутентификация
   # ===========================================================================
@@ -394,7 +596,10 @@ paths:
       tags: [devices]
       operationId: deleteDevice
       summary: Удалить устройство вместе с данными
-      description: Токен агента перестаёт действовать; действие попадает в аудит.
+      description: |
+        Токен агента перестаёт действовать; действие попадает в аудит.
+        С модулем выполнения (v2.0) устройство с историей задач не удаляется (409 — история
+        выполнения хранится как доказательная база); его выводят из эксплуатации (`retired`).
       x-required-role: admin
       responses:
         '204':
@@ -403,6 +608,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
 
   /api/v1/devices/{deviceId}/approve:
     parameters:
@@ -1028,6 +1235,1321 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
 
+  # ===========================================================================
+  # Web API — модуль выполнения скриптов и управления ПО (v2.0, проект)
+  # Изменяющие операции требуют повторного входа не старше 10 минут (step-up),
+  # пишутся в аудит и пересылаются в SIEM. Инварианты дублируются в БД
+  # (docs/db/schema_execution.sql) и независимо проверяются агентом.
+  # ===========================================================================
+  /api/v1/scripts:
+    get:
+      tags: [scripts]
+      operationId: listScripts
+      summary: Библиотека скриптов
+      x-required-permission: [script.author, script.approve, script.run, script.run_high_impact]
+      parameters:
+        - name: q
+          in: query
+          description: Поиск по названию и категории
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница библиотеки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScriptPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [scripts]
+      operationId: createScript
+      summary: Создать скрипт (карточка; код — в версиях)
+      x-required-permission: script.author
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScriptInput'
+      responses:
+        '201':
+          description: Создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Script'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/scripts/{scriptId}:
+    parameters:
+      - $ref: '#/components/parameters/ScriptId'
+    get:
+      tags: [scripts]
+      operationId: getScript
+      summary: Скрипт и список его версий
+      x-required-permission: [script.author, script.approve, script.run, script.run_high_impact]
+      responses:
+        '200':
+          description: Скрипт
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Script'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/scripts/{scriptId}/versions:
+    parameters:
+      - $ref: '#/components/parameters/ScriptId'
+    post:
+      tags: [scripts]
+      operationId: createScriptVersion
+      summary: Создать черновик новой версии
+      x-required-permission: script.author
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScriptVersionInput'
+      responses:
+        '201':
+          description: Черновик создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScriptVersion'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/script-versions/{versionId}:
+    parameters:
+      - $ref: '#/components/parameters/VersionId'
+    get:
+      tags: [scripts]
+      operationId: getScriptVersion
+      summary: Версия скрипта — код, параметры, ограничения, подписи
+      x-required-permission: [script.author, script.approve, script.run, script.run_high_impact]
+      responses:
+        '200':
+          description: Версия
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScriptVersion'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [scripts]
+      operationId: updateScriptVersion
+      summary: Изменить черновик (только автор и только в статусе draft)
+      x-required-permission: script.author
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScriptVersionInput'
+      responses:
+        '200':
+          description: Черновик обновлён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScriptVersion'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/script-versions/{versionId}/submit:
+    parameters:
+      - $ref: '#/components/parameters/VersionId'
+    post:
+      tags: [scripts]
+      operationId: submitScriptVersion
+      summary: Отправить версию на согласование
+      description: |
+        Сервер проверяет версию статически (схема параметров, размер, запрещённые конструкции —
+        docs/execution.md, 5.3), формирует манифест — канонический JSON (RFC 8785) вместе с кодом
+        скрипта — и фиксирует его байты. Версия становится неизменяемой и появляется в
+        `GET /api/v1/signing-requests`: подписывают автор и другой сотрудник с `script.approve`.
+      x-required-permission: script.author
+      responses:
+        '200':
+          description: Версия отправлена (`pending_approval`, заполнен `manifest_sha256`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScriptVersion'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/script-versions/{versionId}/retire:
+    parameters:
+      - $ref: '#/components/parameters/VersionId'
+    post:
+      tags: [scripts]
+      operationId: retireScriptVersion
+      summary: Вывести версию из обращения
+      description: Новые запуски версии невозможны; открытые задачи этой версии отменяются.
+      x-required-permission: [script.approve, execution.admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonInput'
+      responses:
+        '204':
+          description: Выведена из обращения
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/signing-requests:
+    get:
+      tags: [signing]
+      operationId: listSigningRequests
+      summary: Что ждёт моей подписи
+      description: |
+        Список для утилиты `invmon-sign` на рабочем месте сотрудника. Автор или инициатор видит свои
+        отправленные объекты (роль `author`). Согласующий видит чужие объекты, на согласование
+        которых у него есть право (роль `approver`); свои объекты согласующему не показываются.
+      x-required-permission: [script.author, script.approve, package.manage, package.approve, script.run, script.run_high_impact, deployment.run]
+      responses:
+        '200':
+          description: Объекты, ожидающие подписи текущего пользователя
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SigningRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/signing-requests/{subjectType}/{subjectId}/manifest:
+    parameters:
+      - $ref: '#/components/parameters/SubjectType'
+      - $ref: '#/components/parameters/SubjectId'
+    get:
+      tags: [signing]
+      operationId: getSigningManifest
+      summary: Точные байты манифеста для подписи
+      description: |
+        Возвращает ровно те байты, которые подписываются и которые получит агент. `invmon-sign`
+        сам считает SHA-256 и показывает сотруднику содержимое — код скрипта, аргументы установщика,
+        список ПК — из этих байтов, а не из веб-интерфейса. Затем подписывает ключом на токене
+        (PIN + касание).
+      x-required-permission: [script.author, script.approve, package.manage, package.approve, script.run, script.run_high_impact, deployment.run]
+      responses:
+        '200':
+          description: Манифест (UTF-8 JSON, байты не нормализовать)
+          headers:
+            Repr-Digest:
+              description: RFC 9530, SHA-256 манифеста
+              schema:
+                type: string
+              example: 'sha-256=:MFNyB1PBlDiEii6QOApEGp89sI4iEJDY/o9VxTDlzl0=:'
+          content:
+            application/vnd.invmon.manifest+json:
+              schema:
+                type: string
+                contentMediaType: application/json
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/signing-requests/{subjectType}/{subjectId}/signatures:
+    parameters:
+      - $ref: '#/components/parameters/SubjectType'
+      - $ref: '#/components/parameters/SubjectId'
+    post:
+      tags: [signing]
+      operationId: addSignature
+      summary: Добавить подпись автора или согласующего
+      description: |
+        Сервер проверяет подпись ECDSA P-256 открытым ключом с указанным отпечатком. Ключ должен
+        принадлежать текущему пользователю и не быть отозван. Проверяются также роль подписанта
+        (автор или инициатор против согласующего) и совпадение с текущим манифестом; те же
+        инварианты закреплены в БД. Когда есть обе подписи, объект переходит дальше автоматически:
+        версия — в `approved`, запуск или развёртывание — в `scheduled`.
+      x-required-permission: [script.author, script.approve, package.manage, package.approve, script.run, script.run_high_impact, deployment.run]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignatureInput'
+      responses:
+        '201':
+          description: Подпись принята
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignatureResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/signing-requests/{subjectType}/{subjectId}/reject:
+    parameters:
+      - $ref: '#/components/parameters/SubjectType'
+      - $ref: '#/components/parameters/SubjectId'
+    post:
+      tags: [signing]
+      operationId: rejectSigningRequest
+      summary: Отклонить (согласующий)
+      description: Версия переходит в `rejected`, запуск или развёртывание — в `canceled`.
+      x-required-permission: [script.approve, package.approve]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonInput'
+      responses:
+        '204':
+          description: Отклонено
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/script-runs:
+    get:
+      tags: [script-runs]
+      operationId: listScriptRuns
+      summary: Запуски скриптов
+      x-required-permission: [script.run, script.run_high_impact, task.view_output, task.cancel_any]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/JobStatus'
+        - name: script_id
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: created_by
+          in: query
+          description: Логин инициатора
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница запусков
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScriptRunPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [script-runs]
+      operationId: createScriptRun
+      summary: Запустить скрипт на выбранных ПК (поставить задачи в очередь)
+      description: |
+        1. Проверки сервера: версия `approved`; параметры проходят `params_schema` версии; у
+           инициатора есть `script.run` (для скриптов high_impact — `script.run_high_impact`) в группе
+           **каждого** целевого ПК, иначе 403 со списком ПК; повторный вход не старше 10 минут.
+        2. Цели разрешаются в список ПК. ПК, на которых задача заведомо не выполнится, попадают в
+           `excluded` с причиной: выполнение выключено локальной политикой, ПК не доверяет ключам
+           подписантов версии, ОС или PowerShell ниже требуемых.
+        3. На каждый ПК создаётся строка `agent_tasks` в состоянии `queued`; агенты забирают задачи
+           сами (`POST /api/agent/v1/tasks/claim`).
+        4. Если скрипт помечен high_impact или ПК больше `approval_required_above_targets` (по умолчанию 25),
+           запуск создаётся в статусе `pending_approval` с манифестом запуска. Его подписывают
+           инициатор и другой сотрудник с `script.approve`; до этого задачи не выдаются.
+
+        Заголовок `Idempotency-Key` защищает от двойного запуска при повторе запроса.
+      x-required-permission: [script.run, script.run_high_impact]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScriptRunInput'
+      responses:
+        '201':
+          description: Запуск создан, задачи поставлены в очередь
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScriptRun'
+              examples:
+                scheduled:
+                  summary: Обычный запуск — задачи сразу доступны агентам
+                  value:
+                    id: 311
+                    status: scheduled
+                    script: {id: 12, name: Очистка временных файлов Windows, version_id: 42, version: 3, high_impact: false}
+                    parameters: {min_age_days: 7}
+                    targets: {group_ids: [3]}
+                    target_count: 18
+                    excluded:
+                      - {device_id: 57, hostname: PC-ACC-031, reason: execution_disabled_locally}
+                    reason: 'INC-1024: мало места на C: у бухгалтерии'
+                    created_by: {id: 4, username: sidorov, display_name: Сидоров С. С.}
+                    created_at: '2026-09-29T08:00:00Z'
+                    not_before: '2026-09-29T08:00:00Z'
+                    expires_at: '2026-09-30T08:00:00Z'
+                    max_concurrency: 10
+                    requires_approval: false
+                    signatures: []
+                    counts: {tasks: 18, queued: 18, in_progress: 0, succeeded: 0, failed: 0, lost: 0, rejected: 0, canceled_or_expired: 0, reboot_required: 0}
+                pendingApproval:
+                  summary: Скрипт high_impact — ждёт подписей инициатора и согласующего
+                  value:
+                    id: 318
+                    status: pending_approval
+                    script: {id: 15, name: Сброс кэша Windows Update, version_id: 51, version: 1, high_impact: true}
+                    parameters: {}
+                    targets: {device_ids: [42]}
+                    target_count: 1
+                    excluded: []
+                    reason: 'INC-1040: не устанавливаются обновления'
+                    created_by: {id: 4, username: sidorov, display_name: Сидоров С. С.}
+                    created_at: '2026-09-29T08:05:00Z'
+                    not_before: '2026-09-29T08:05:00Z'
+                    expires_at: '2026-09-30T08:05:00Z'
+                    requires_approval: true
+                    run_manifest_sha256: 439f8b953015962f2ac79687fa7dc263837fcfca216b4fd44bfa6d78f325f391
+                    signatures: []
+                    counts: {tasks: 1, queued: 1, in_progress: 0, succeeded: 0, failed: 0, lost: 0, rejected: 0, canceled_or_expired: 0, reboot_required: 0}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/script-runs/{runId}:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [script-runs]
+      operationId: getScriptRun
+      summary: Статус запуска — сводка по ПК, подписи, отмена
+      x-required-permission: [script.run, script.run_high_impact, task.view_output, task.cancel_any]
+      responses:
+        '200':
+          description: Запуск и сводка по задачам
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScriptRun'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/script-runs/{runId}/tasks:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    get:
+      tags: [script-runs]
+      operationId: listScriptRunTasks
+      summary: Задачи запуска по ПК — состояние, код возврата, время (без вывода)
+      x-required-permission: [script.run, script.run_high_impact, task.view_output, task.cancel_any]
+      parameters:
+        - name: state
+          in: query
+          schema:
+            $ref: '#/components/schemas/TaskState'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница задач
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentTaskPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/script-runs/{runId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/RunId'
+    post:
+      tags: [script-runs]
+      operationId: cancelScriptRun
+      summary: Отменить запуск
+      description: |
+        Отменить может инициатор или пользователь с `task.cancel_any`.
+        * Задачи в очереди и выданные агенту, но ещё не начатые, отменяются сразу: на событие
+          `started` агент получит 409 и не запустит процесс.
+        * Выполняемым задачам выставляется флаг отмены. Агент узнаёт о нём из ответа на ближайший
+          heartbeat (не реже раза в 10 с), завершает Job Object задачи вместе с дочерними процессами
+          и присылает итог `canceled`.
+        * Завершённые задачи не меняются. Повторная отмена — 409.
+      x-required-permission: [script.run, script.run_high_impact, task.cancel_any]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonInput'
+            example:
+              reason: 'Ошибка в параметрах, перезапуск по INC-1024'
+      responses:
+        '202':
+          description: Отмена принята; итог выполняемых задач придёт от агентов
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/tasks/{taskId}:
+    parameters:
+      - $ref: '#/components/parameters/TaskId'
+    get:
+      tags: [script-runs]
+      operationId: getAgentTask
+      summary: Задача на ПК с выводом (stdout / stderr)
+      description: |
+        Вывод может содержать персональные данные, поэтому нужно право `task.view_output` в группе ПК.
+        Каждый просмотр пишется в аудит (`task.output_view`). Вывод хранится `output_retention_days`
+        (по умолчанию 90 дней), затем очищается; код возврата и итог хранятся дольше.
+      x-required-permission: task.view_output
+      responses:
+        '200':
+          description: Задача и вывод
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentTaskDetails'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/packages:
+    get:
+      tags: [packages]
+      operationId: listPackages
+      summary: Каталог ПО для установки
+      x-required-permission: [package.manage, package.approve, deployment.run]
+      parameters:
+        - name: q
+          in: query
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница каталога
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoftwarePackagePage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [packages]
+      operationId: createPackage
+      summary: Добавить пакет в каталог
+      x-required-permission: package.manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SoftwarePackageInput'
+      responses:
+        '201':
+          description: Пакет создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoftwarePackage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/packages/{packageId}:
+    parameters:
+      - $ref: '#/components/parameters/PackageId'
+    get:
+      tags: [packages]
+      operationId: getPackage
+      summary: Пакет и его версии
+      x-required-permission: [package.manage, package.approve, deployment.run]
+      responses:
+        '200':
+          description: Пакет
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SoftwarePackage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/package-files/{sha256}:
+    parameters:
+      - name: sha256
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Sha256Hex'
+    put:
+      tags: [packages]
+      operationId: uploadPackageFile
+      summary: Загрузить установщик (адресация по содержимому)
+      description: |
+        Тело — файл установщика (до 2 ГБ). Сервер сверяет SHA-256 тела с путём, поэтому повторная
+        загрузка идемпотентна. Подпись издателя (Authenticode) проверяется для информации;
+        окончательно её проверяет агент на ПК. Файлы хранятся вне БД, в каталоге данных сервера.
+      x-required-permission: package.manage
+      parameters:
+        - name: X-File-Name
+          in: header
+          required: true
+          schema:
+            type: string
+            maxLength: 255
+          example: googlechromestandaloneenterprise64.msi
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              contentMediaType: application/octet-stream
+      responses:
+        '200':
+          description: Такой файл уже загружен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PackageFile'
+        '201':
+          description: Файл загружен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PackageFile'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  /api/v1/packages/{packageId}/versions:
+    parameters:
+      - $ref: '#/components/parameters/PackageId'
+    post:
+      tags: [packages]
+      operationId: createPackageVersion
+      summary: Создать черновик версии пакета из загруженного установщика
+      x-required-permission: package.manage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PackageVersionInput'
+      responses:
+        '201':
+          description: Черновик создан
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PackageVersion'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/package-versions/{packageVersionId}:
+    parameters:
+      - $ref: '#/components/parameters/PackageVersionId'
+    get:
+      tags: [packages]
+      operationId: getPackageVersion
+      summary: Версия пакета — установщик, аргументы, обнаружение, подписи
+      x-required-permission: [package.manage, package.approve, deployment.run]
+      responses:
+        '200':
+          description: Версия пакета
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PackageVersion'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/package-versions/{packageVersionId}/submit:
+    parameters:
+      - $ref: '#/components/parameters/PackageVersionId'
+    post:
+      tags: [packages]
+      operationId: submitPackageVersion
+      summary: Отправить версию пакета на согласование
+      description: |
+        Фиксируется манифест: SHA-256 и размер установщика, аргументы установки и удаления,
+        правило обнаружения, коды успеха, ожидаемый издатель. Подписывают автор и другой
+        сотрудник с `package.approve`.
+      x-required-permission: package.manage
+      responses:
+        '200':
+          description: Отправлено (`pending_approval`)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PackageVersion'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/deployments:
+    get:
+      tags: [deployments]
+      operationId: listDeployments
+      summary: Развёртывания ПО
+      x-required-permission: [deployment.run, task.cancel_any, package.approve]
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/JobStatus'
+        - name: package_id
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: policy_id
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница развёртываний
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [deployments]
+      operationId: createDeployment
+      summary: Установить, обновить или удалить ПО на выбранных ПК
+      description: |
+        Проверки и постановка задач — как у `createScriptRun`. Вдобавок:
+        * версия пакета `approved`; для удаления в её манифесте есть способ удаления;
+        * задачи раскладываются по кольцам (`ring_plan`); кольцо N+1 открывается, когда кольцо N
+          завершено, доля ошибок в нём не выше `max_failure_pct` и прошла выдержка `soak_hours`;
+        * при превышении порога ошибок развёртывание встаёт на паузу с `paused_reason`;
+        * задача выдаётся только в окне обслуживания, а после `deadline` — в любое время.
+          Перезагрузка по умолчанию подавляется: итог `reboot_required` виден в отчёте.
+      x-required-permission: deployment.run
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeploymentInput'
+      responses:
+        '201':
+          description: Развёртывание создано
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/deployments/{deploymentId}:
+    parameters:
+      - $ref: '#/components/parameters/DeploymentId'
+    get:
+      tags: [deployments]
+      operationId: getDeployment
+      summary: Статус развёртывания — кольца, сводка, пауза
+      x-required-permission: [deployment.run, task.cancel_any, package.approve]
+      responses:
+        '200':
+          description: Развёртывание
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Deployment'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/deployments/{deploymentId}/tasks:
+    parameters:
+      - $ref: '#/components/parameters/DeploymentId'
+    get:
+      tags: [deployments]
+      operationId: listDeploymentTasks
+      summary: Задачи развёртывания по ПК
+      x-required-permission: [deployment.run, task.cancel_any, package.approve]
+      parameters:
+        - name: state
+          in: query
+          schema:
+            $ref: '#/components/schemas/TaskState'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Страница задач
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentTaskPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/deployments/{deploymentId}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/DeploymentId'
+    post:
+      tags: [deployments]
+      operationId: cancelDeployment
+      summary: Отменить развёртывание (семантика — как у отмены запуска)
+      x-required-permission: [deployment.run, task.cancel_any]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonInput'
+      responses:
+        '202':
+          description: Отмена принята
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/deployments/{deploymentId}/pause:
+    parameters:
+      - $ref: '#/components/parameters/DeploymentId'
+    post:
+      tags: [deployments]
+      operationId: pauseDeployment
+      summary: Приостановить выдачу задач (выполняемые доработают)
+      x-required-permission: [deployment.run, task.cancel_any]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonInput'
+      responses:
+        '204':
+          description: Приостановлено
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/deployments/{deploymentId}/resume:
+    parameters:
+      - $ref: '#/components/parameters/DeploymentId'
+    post:
+      tags: [deployments]
+      operationId: resumeDeployment
+      summary: Возобновить (в том числе после автопаузы по порогу ошибок)
+      x-required-permission: deployment.run
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonInput'
+      responses:
+        '204':
+          description: Возобновлено
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/deployment-policies:
+    get:
+      tags: [deployments]
+      operationId: listDeploymentPolicies
+      summary: Политики ПО (обязательное и запрещённое)
+      x-required-permission: [deployment.run, package.approve]
+      responses:
+        '200':
+          description: Политики
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/DeploymentPolicy'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [deployments]
+      operationId: createDeploymentPolicy
+      summary: Создать политику (выключена до одобрения другим сотрудником)
+      x-required-permission: deployment.run
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeploymentPolicyInput'
+      responses:
+        '201':
+          description: Политика создана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentPolicy'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/deployment-policies/{policyId}:
+    parameters:
+      - $ref: '#/components/parameters/PolicyId'
+    patch:
+      tags: [deployments]
+      operationId: updateDeploymentPolicy
+      summary: Изменить или выключить политику
+      description: |
+        Изменение сути политики (область, версия, окна, кольца, порог) снимает одобрение и
+        выключает её до повторного одобрения. Выключить (`enabled: false`) можно без одобрения.
+      x-required-permission: deployment.run
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeploymentPolicyPatch'
+      responses:
+        '200':
+          description: Политика обновлена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentPolicy'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/deployment-policies/{policyId}/approve:
+    parameters:
+      - $ref: '#/components/parameters/PolicyId'
+    post:
+      tags: [deployments]
+      operationId: approveDeploymentPolicy
+      summary: Одобрить и включить политику (не автор политики)
+      x-required-permission: package.approve
+      responses:
+        '200':
+          description: Политика включена
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentPolicy'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/deployment-policies/{policyId}/compliance:
+    parameters:
+      - $ref: '#/components/parameters/PolicyId'
+    get:
+      tags: [deployments]
+      operationId: getPolicyCompliance
+      summary: Соответствие политике по данным инвентаризации
+      x-required-permission: [deployment.run, package.approve]
+      responses:
+        '200':
+          description: Сводка и несоответствующие ПК
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyCompliance'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/v1/execution/settings:
+    get:
+      tags: [execution-admin]
+      operationId: getExecutionSettings
+      summary: Настройки модуля выполнения
+      x-required-permission: execution.admin
+      responses:
+        '200':
+          description: Настройки
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionSettings'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    put:
+      tags: [execution-admin]
+      operationId: updateExecutionSettings
+      summary: Изменить настройки модуля
+      description: |
+        Включить модуль (`enabled: true`) можно только при настроенной пересылке аудита в SIEM.
+        Стоп-кран — отдельный эндпоинт `POST /api/v1/execution/kill-switch`.
+      x-required-permission: execution.admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecutionSettings'
+      responses:
+        '200':
+          description: Настройки сохранены
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionSettings'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/execution/kill-switch:
+    post:
+      tags: [execution-admin]
+      operationId: setKillSwitch
+      summary: Стоп-кран — остановить или возобновить выдачу задач на весь парк
+      description: |
+        `engaged: true` — сервер перестаёт выдавать задачи, агенты получают `execution_paused` в
+        ответе на метрики. С `cancel_running: true` выполняемым задачам выставляется флаг отмены.
+        Нажать может `execution.admin`; повторный вход при включении не требуется — важна скорость.
+      x-required-permission: execution.admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KillSwitchInput'
+      responses:
+        '200':
+          description: Состояние стоп-крана
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionSettings'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/v1/signing-keys:
+    get:
+      tags: [execution-admin]
+      operationId: listSigningKeys
+      summary: Ключи подписантов
+      description: Отпечатки из этого списка администратор домена вносит в GPO `TrustedSigners`.
+      x-required-permission: [execution.admin, script.approve, package.approve]
+      responses:
+        '200':
+          description: Ключи
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SigningKey'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [execution-admin]
+      operationId: registerSigningKey
+      summary: Зарегистрировать открытый ключ сотрудника
+      description: |
+        Ключ создаётся на токене (PIV) и не покидает его. Аттестация PIV подтверждает, что ключ
+        сгенерирован на устройстве. Регистрация сама по себе агентам ничего не разрешает: они
+        доверяют только отпечаткам из локальной политики.
+      x-required-permission: execution.admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SigningKeyInput'
+      responses:
+        '201':
+          description: Ключ зарегистрирован
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SigningKey'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/signing-keys/{keyId}/revoke:
+    parameters:
+      - name: keyId
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+    post:
+      tags: [execution-admin]
+      operationId: revokeSigningKey
+      summary: Отозвать ключ
+      description: |
+        Отзыв окончателен. Сервер перестаёт принимать подписи этим ключом. Версии, подписанные им,
+        выводятся из обращения, а их открытые задачи отменяются. Отпечаток также удаляется из GPO
+        `TrustedSigners` — после этого агенты отвергают такие подписи и без сервера.
+      x-required-permission: execution.admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonInput'
+      responses:
+        '204':
+          description: Отозван
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/execution/permissions:
+    get:
+      tags: [execution-admin]
+      operationId: listPermissionGrants
+      summary: Выданные права модуля
+      x-required-permission: execution.admin
+      responses:
+        '200':
+          description: Права
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PermissionGrant'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [execution-admin]
+      operationId: grantPermission
+      summary: Выдать право (себе — нельзя)
+      x-required-permission: execution.admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PermissionGrantInput'
+      responses:
+        '201':
+          description: Право выдано
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PermissionGrant'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/ReauthRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/v1/execution/permissions/{grantId}:
+    parameters:
+      - name: grantId
+        in: path
+        required: true
+        schema:
+          type: integer
+          format: int64
+    delete:
+      tags: [execution-admin]
+      operationId: revokePermission
+      summary: Отозвать право
+      x-required-permission: execution.admin
+      responses:
+        '204':
+          description: Отозвано
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
 # =============================================================================
 # Исходящие webhook-уведомления (сервер → внешняя система)
 # =============================================================================
@@ -1097,6 +2619,83 @@ components:
       schema:
         type: string
         enum: [gzip, identity]
+    TaskId:
+      name: taskId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    ScriptId:
+      name: scriptId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    VersionId:
+      name: versionId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    PackageId:
+      name: packageId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    PackageVersionId:
+      name: packageVersionId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    DeploymentId:
+      name: deploymentId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    PolicyId:
+      name: policyId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    SubjectType:
+      name: subjectType
+      in: path
+      required: true
+      schema:
+        $ref: '#/components/schemas/SubjectType'
+    SubjectId:
+      name: subjectId
+      in: path
+      required: true
+      schema:
+        type: integer
+        format: int64
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: UUID запроса; повтор с тем же ключом в течение 24 ч возвращает исходный результат
+      schema:
+        type: string
+        format: uuid
 
   responses:
     BadRequest:
@@ -1124,6 +2723,19 @@ components:
             title: Invalid or expired token
             status: 401
             code: invalid_token
+    ReauthRequired:
+      description: |
+        Нужен повторный вход не старше 10 минут (step-up) — для изменяющих операций модуля
+        выполнения; либо нет сессии
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+          example:
+            type: https://invmon.corp.local/problems/reauthentication-required
+            title: Recent re-authentication required
+            status: 401
+            code: reauthentication_required
     Forbidden:
       description: Недостаточно прав
       content:
@@ -1455,6 +3067,8 @@ components:
           maxItems: 50
           items:
             $ref: '#/components/schemas/CollectorError'
+        execution:
+          $ref: '#/components/schemas/ExecutionCapabilities'
 
     MetricsBatch:
       type: object
@@ -1529,6 +3143,19 @@ components:
           description: Администратор нажал «Обновить инвентаризацию»
         rotate_token:
           type: boolean
+        tasks_pending:
+          type: boolean
+          description: 'v2.0: для ПК есть задачи к выдаче — агент вызывает POST /api/agent/v1/tasks/claim'
+        cancel_task_ids:
+          type: array
+          maxItems: 100
+          description: 'v2.0: выполняемые на ПК задачи, для которых запрошена отмена'
+          items:
+            type: integer
+            format: int64
+        execution_paused:
+          type: boolean
+          description: 'v2.0: включён стоп-кран — новые задачи не начинать'
       example:
         accepted: {host: 2, disks: 1}
         config_version: 3
@@ -2655,3 +4282,1830 @@ components:
           group: Бухгалтерия
           ip: 192.168.10.23
           url: https://invmon.corp.local/devices/42
+
+    # ------------------------------------------ Модуль выполнения (v2.0, проект)
+    Sha256Hex:
+      type: string
+      pattern: '^[0-9a-f]{64}$'
+      description: SHA-256, hex в нижнем регистре
+    UserRef:
+      type: object
+      required: [id, username]
+      properties:
+        id:
+          type: integer
+          format: int64
+        username:
+          type: string
+        display_name:
+          type: string
+    Permission:
+      type: string
+      enum: [script.author, script.approve, script.run, script.run_high_impact, package.manage,
+             package.approve, deployment.run, task.view_output, task.cancel_any, execution.admin]
+    ArtifactStatus:
+      type: string
+      enum: [draft, pending_approval, approved, rejected, retired]
+    JobStatus:
+      type: string
+      enum: [pending_approval, scheduled, running, paused, completed, canceled, expired]
+    TaskState:
+      type: string
+      enum: [queued, dispatched, running, succeeded, failed, timed_out, canceled, expired, rejected, lost]
+    SubjectType:
+      type: string
+      enum: [script_version, package_version, script_run, deployment]
+    ReasonInput:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 1000
+          description: Обоснование — номер заявки и причина; попадает в аудит
+    TargetSpec:
+      type: object
+      description: |
+        Цели — объединение перечисленных ПК, групп и тегов. Сервер разрешает их в список ПК при
+        создании; каждый ПК должен входить в область прав инициатора, иначе запрос отклоняется целиком.
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        device_ids:
+          type: array
+          maxItems: 1000
+          items:
+            type: integer
+            format: int64
+        group_ids:
+          type: array
+          maxItems: 100
+          items:
+            type: integer
+            format: int64
+        tags:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+    ExcludedTarget:
+      type: object
+      description: ПК из целей, на который задача не поставлена, и причина
+      required: [device_id, hostname, reason]
+      properties:
+        device_id:
+          type: integer
+          format: int64
+        hostname:
+          type: string
+        reason:
+          type: string
+          enum: [execution_disabled_locally, untrusted_signer, os_unsupported, powershell_unsupported,
+                 arch_mismatch, device_not_active]
+    SignatureInfo:
+      type: object
+      required: [role, signer, key_fingerprint, signed_at]
+      properties:
+        role:
+          type: string
+          enum: [author, approver]
+        signer:
+          $ref: '#/components/schemas/UserRef'
+        key_fingerprint:
+          $ref: '#/components/schemas/Sha256Hex'
+        signed_at:
+          type: string
+          format: date-time
+        comment:
+          type: string
+    JobCounts:
+      type: object
+      description: Сводка по задачам на ПК (представление v_job_summary)
+      required: [tasks, queued, in_progress, succeeded, failed, lost, rejected, canceled_or_expired, reboot_required]
+      properties:
+        tasks:
+          type: integer
+        queued:
+          type: integer
+        in_progress:
+          type: integer
+          description: dispatched + running
+        succeeded:
+          type: integer
+        failed:
+          type: integer
+          description: failed + timed_out
+        lost:
+          type: integer
+          description: Агент не отчитался вовремя; поздний итог ещё может прийти
+        rejected:
+          type: integer
+          description: Агент отказался выполнять (подпись, локальная политика, параметры, ОС)
+        canceled_or_expired:
+          type: integer
+        reboot_required:
+          type: integer
+    CancelResult:
+      type: object
+      required: [status, canceled_queued, cancel_requested_running]
+      properties:
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        canceled_queued:
+          type: integer
+          description: Задач, снятых до начала выполнения
+        cancel_requested_running:
+          type: integer
+          description: Выполняемых задач, которым отправлен сигнал отмены
+      example:
+        status: canceled
+        canceled_queued: 4
+        cancel_requested_running: 6
+
+    ScriptInput:
+      type: object
+      required: [name, interpreter]
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 4000
+        category:
+          type: string
+          maxLength: 100
+        interpreter:
+          type: string
+          enum: [powershell, cmd]
+        high_impact:
+          type: boolean
+          default: false
+          description: Каждый запуск подписывают инициатор и согласующий
+      example:
+        name: Очистка временных файлов Windows
+        description: Удаляет из %SystemRoot%\Temp файлы старше N дней
+        category: обслуживание
+        interpreter: powershell
+        high_impact: false
+    Script:
+      type: object
+      required: [id, name, description, category, interpreter, high_impact, created_by, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        description:
+          type: string
+        category:
+          type: string
+        interpreter:
+          type: string
+          enum: [powershell, cmd]
+        high_impact:
+          type: boolean
+        approved_version:
+          type: [integer, 'null']
+          description: Последняя одобренная версия
+        created_by:
+          $ref: '#/components/schemas/UserRef'
+        created_at:
+          type: string
+          format: date-time
+        archived_at:
+          type: [string, 'null']
+          format: date-time
+        versions:
+          type: array
+          description: Только в `GET /api/v1/scripts/{scriptId}`
+          items:
+            $ref: '#/components/schemas/ScriptVersionSummary'
+    ScriptVersionSummary:
+      type: object
+      required: [id, version, status, author, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        version:
+          type: integer
+        status:
+          $ref: '#/components/schemas/ArtifactStatus'
+        author:
+          $ref: '#/components/schemas/UserRef'
+        change_note:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        decided_at:
+          type: [string, 'null']
+          format: date-time
+    ScriptPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Script'
+        next_cursor:
+          type: [string, 'null']
+    ScriptVersionInput:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          maxLength: 262144
+          description: |
+            Код скрипта (UTF-8). Параметры скрипт получает в переменных окружения
+            `INVMON_PARAM_<ИМЯ>` — не в командной строке.
+        params_schema:
+          type: object
+          description: |
+            Подмножество JSON Schema: объект с `properties` типов string, integer, boolean и
+            `additionalProperties: false`. У строк обязательны `enum` или `pattern` + `maxLength`;
+            для cmd в строках запрещены символы `& | < > ^ % ! "`.
+          additionalProperties: true
+        timeout_s:
+          type: integer
+          minimum: 10
+          maximum: 14400
+          default: 600
+        run_as:
+          type: string
+          enum: [system, local_service]
+          default: system
+          description: LocalSystem или NT AUTHORITY\LocalService (диагностика без прав администратора)
+        max_output_bytes:
+          type: integer
+          minimum: 1024
+          maximum: 10485760
+          default: 1048576
+        success_exit_codes:
+          type: array
+          minItems: 1
+          maxItems: 20
+          default: [0]
+          items:
+            type: integer
+        min_os_build:
+          type: [integer, 'null']
+          description: 7601 — Windows 7 SP1, 9600 — 8.1, 19045 — 10 22H2
+        min_powershell_version:
+          type: [string, 'null']
+          pattern: '^[0-9]+\.[0-9]+$'
+        change_note:
+          type: string
+          maxLength: 2000
+      example:
+        content: |
+          $days  = [int]$env:INVMON_PARAM_MIN_AGE_DAYS
+          $limit = (Get-Date).AddDays(-$days)
+          $deleted = 0; $freed = 0
+          Get-ChildItem "$env:SystemRoot\Temp" -Recurse -Force -ErrorAction SilentlyContinue |
+              Where-Object { -not $_.PSIsContainer -and $_.LastWriteTime -lt $limit } |
+              ForEach-Object {
+                  try { $len = $_.Length; Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $deleted++; $freed += $len }
+                  catch { }   # файл занят — пропускаем
+              }
+          "Удалено файлов: $deleted, освобождено МБ: $([math]::Round($freed / 1MB, 1))"
+        params_schema:
+          type: object
+          additionalProperties: false
+          required: [min_age_days]
+          properties:
+            min_age_days:
+              type: integer
+              minimum: 1
+              maximum: 365
+        timeout_s: 600
+        run_as: system
+        max_output_bytes: 65536
+        success_exit_codes: [0]
+        min_os_build: 7601
+        min_powershell_version: '2.0'
+        change_note: Порог возраста файлов вынесен в параметр
+    ScriptVersion:
+      type: object
+      required: [id, script_id, version, status, interpreter, high_impact, content, content_sha256, params_schema,
+                 timeout_s, run_as, max_output_bytes, success_exit_codes, author, created_at, signatures]
+      properties:
+        id:
+          type: integer
+          format: int64
+        script_id:
+          type: integer
+          format: int64
+        version:
+          type: integer
+        status:
+          $ref: '#/components/schemas/ArtifactStatus'
+        interpreter:
+          type: string
+          enum: [powershell, cmd]
+        high_impact:
+          type: boolean
+        content:
+          type: string
+        content_sha256:
+          $ref: '#/components/schemas/Sha256Hex'
+        params_schema:
+          type: object
+          additionalProperties: true
+        timeout_s:
+          type: integer
+        run_as:
+          type: string
+          enum: [system, local_service]
+        max_output_bytes:
+          type: integer
+        success_exit_codes:
+          type: array
+          items:
+            type: integer
+        min_os_build:
+          type: [integer, 'null']
+        min_powershell_version:
+          type: [string, 'null']
+        change_note:
+          type: string
+        manifest_sha256:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{64}$'
+          description: Заполняется при отправке на согласование
+        author:
+          $ref: '#/components/schemas/UserRef'
+        created_at:
+          type: string
+          format: date-time
+        submitted_at:
+          type: [string, 'null']
+          format: date-time
+        decided_at:
+          type: [string, 'null']
+          format: date-time
+        signatures:
+          type: array
+          items:
+            $ref: '#/components/schemas/SignatureInfo'
+
+    SigningRequest:
+      type: object
+      required: [subject_type, subject_id, title, expected_role, manifest_sha256, requested_by, submitted_at, signatures]
+      properties:
+        subject_type:
+          $ref: '#/components/schemas/SubjectType'
+        subject_id:
+          type: integer
+          format: int64
+        title:
+          type: string
+        expected_role:
+          type: string
+          enum: [author, approver]
+          description: В какой роли подписывает текущий пользователь
+        manifest_sha256:
+          $ref: '#/components/schemas/Sha256Hex'
+        requested_by:
+          $ref: '#/components/schemas/UserRef'
+        submitted_at:
+          type: string
+          format: date-time
+        signatures:
+          type: array
+          items:
+            $ref: '#/components/schemas/SignatureInfo'
+      example:
+        subject_type: script_version
+        subject_id: 42
+        title: Очистка временных файлов Windows, версия 3
+        expected_role: approver
+        manifest_sha256: 3053720753c19438848a2e90380a441a9f3db08e221090d8fe8f55c530e5ce5d
+        requested_by: {id: 2, username: petrov, display_name: Петров П. П.}
+        submitted_at: '2026-09-29T07:00:00Z'
+        signatures:
+          - role: author
+            signer: {id: 2, username: petrov, display_name: Петров П. П.}
+            key_fingerprint: 0976d74509a4d74b592322296e90d2464ebed6d0604d8b93a7efecac3c690d97
+            signed_at: '2026-09-29T07:01:10Z'
+    SignatureInput:
+      type: object
+      required: [role, key_fingerprint, signature]
+      properties:
+        role:
+          type: string
+          enum: [author, approver]
+        key_fingerprint:
+          $ref: '#/components/schemas/Sha256Hex'
+        signature:
+          type: string
+          contentEncoding: base64
+          maxLength: 200
+          description: ECDSA P-256 (ASN.1 DER) над `invmon-manifest-v1\n` + байты манифеста
+        comment:
+          type: string
+          maxLength: 2000
+      example:
+        role: approver
+        key_fingerprint: 7b1f33d829683c4149dc258514814a5b068fcec2851a2144f284f9adcf4e6fe6
+        signature: XdJLZAZ3MW325EOZfEQ8wYojuN+VGHGxxPq0JjRmwaP1uSqrLOWexg==
+        comment: Код проверен; удаляются только файлы старше N дней в %SystemRoot%\Temp
+    SignatureResult:
+      type: object
+      required: [subject_status, signatures]
+      properties:
+        subject_status:
+          type: string
+          description: Статус объекта после подписи (для версии — ArtifactStatus, для запуска и развёртывания — JobStatus)
+          examples: [pending_approval, approved, scheduled]
+        signatures:
+          type: array
+          items:
+            $ref: '#/components/schemas/SignatureInfo'
+
+    ScriptRunInput:
+      type: object
+      required: [script_version_id, targets, reason]
+      properties:
+        script_version_id:
+          type: integer
+          format: int64
+        parameters:
+          type: object
+          additionalProperties: true
+          description: Проверяются по `params_schema` версии — на сервере и повторно агентом
+        targets:
+          $ref: '#/components/schemas/TargetSpec'
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 1000
+          description: Номер заявки и обоснование — в аудит, в журнал событий ПК и (при согласовании) в подписанный манифест
+        not_before:
+          type: string
+          format: date-time
+        expires_in_hours:
+          type: integer
+          minimum: 1
+          maximum: 168
+          default: 24
+          description: Задачи, не выданные за это время (ПК выключен), истекают
+        max_concurrency:
+          type: integer
+          minimum: 1
+          description: Не больше N ПК одновременно
+      example:
+        script_version_id: 42
+        parameters: {min_age_days: 7}
+        targets: {group_ids: [3]}
+        reason: 'INC-1024: мало места на C: у бухгалтерии'
+        expires_in_hours: 24
+        max_concurrency: 10
+    ScriptRun:
+      type: object
+      required: [id, status, script, parameters, targets, target_count, excluded, reason, created_by, created_at,
+                 not_before, expires_at, requires_approval, signatures, counts]
+      properties:
+        id:
+          type: integer
+          format: int64
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        script:
+          type: object
+          required: [id, name, version_id, version, high_impact]
+          properties:
+            id:
+              type: integer
+              format: int64
+            name:
+              type: string
+            version_id:
+              type: integer
+              format: int64
+            version:
+              type: integer
+            high_impact:
+              type: boolean
+        parameters:
+          type: object
+          additionalProperties: true
+        targets:
+          $ref: '#/components/schemas/TargetSpec'
+        target_count:
+          type: integer
+          description: ПК, на которые поставлены задачи
+        excluded:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExcludedTarget'
+        reason:
+          type: string
+        created_by:
+          $ref: '#/components/schemas/UserRef'
+        created_at:
+          type: string
+          format: date-time
+        not_before:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+        max_concurrency:
+          type: [integer, 'null']
+        requires_approval:
+          type: boolean
+        run_manifest_sha256:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{64}$'
+        signatures:
+          type: array
+          items:
+            $ref: '#/components/schemas/SignatureInfo'
+        counts:
+          $ref: '#/components/schemas/JobCounts'
+        cancel_requested_at:
+          type: [string, 'null']
+          format: date-time
+        canceled_by:
+          $ref: '#/components/schemas/UserRef'
+      example:
+        id: 311
+        status: running
+        script: {id: 12, name: Очистка временных файлов Windows, version_id: 42, version: 3, high_impact: false}
+        parameters: {min_age_days: 7}
+        targets: {group_ids: [3]}
+        target_count: 18
+        excluded:
+          - {device_id: 57, hostname: PC-ACC-031, reason: execution_disabled_locally}
+        reason: 'INC-1024: мало места на C: у бухгалтерии'
+        created_by: {id: 4, username: sidorov, display_name: Сидоров С. С.}
+        created_at: '2026-09-29T08:00:00Z'
+        not_before: '2026-09-29T08:00:00Z'
+        expires_at: '2026-09-30T08:00:00Z'
+        finished_at: null
+        max_concurrency: 10
+        requires_approval: false
+        run_manifest_sha256: null
+        signatures: []
+        counts: {tasks: 18, queued: 4, in_progress: 6, succeeded: 7, failed: 1, lost: 0, rejected: 0, canceled_or_expired: 0, reboot_required: 0}
+        cancel_requested_at: null
+    ScriptRunPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScriptRun'
+        next_cursor:
+          type: [string, 'null']
+    AgentTaskSummary:
+      type: object
+      required: [id, device, state, ring, attempt, queued_at, output_bytes, output_truncated, cancel_requested]
+      properties:
+        id:
+          type: integer
+          format: int64
+        device:
+          type: object
+          required: [id, hostname]
+          properties:
+            id:
+              type: integer
+              format: int64
+            hostname:
+              type: string
+        state:
+          $ref: '#/components/schemas/TaskState'
+        ring:
+          type: integer
+        attempt:
+          type: integer
+          description: Номер выдачи агенту
+        queued_at:
+          type: string
+          format: date-time
+        dispatched_at:
+          type: [string, 'null']
+          format: date-time
+        started_at:
+          type: [string, 'null']
+          format: date-time
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+        exit_code:
+          type: [integer, 'null']
+        result:
+          type: [string, 'null']
+          enum: [installed, already_installed, uninstalled, not_installed, reboot_required, null]
+          description: Только для задач ПО
+        error_code:
+          type: [string, 'null']
+          description: Код отказа или ошибки агента (см. TaskResultInput.error_code)
+        output_bytes:
+          type: integer
+          format: int64
+        output_truncated:
+          type: boolean
+        cancel_requested:
+          type: boolean
+    AgentTaskPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentTaskSummary'
+        next_cursor:
+          type: [string, 'null']
+      example:
+        items:
+          - id: 90211
+            device: {id: 42, hostname: PC-ACC-012}
+            state: succeeded
+            ring: 0
+            attempt: 1
+            queued_at: '2026-09-29T08:00:00Z'
+            dispatched_at: '2026-09-29T08:00:41Z'
+            started_at: '2026-09-29T08:00:43Z'
+            finished_at: '2026-09-29T08:01:02Z'
+            exit_code: 0
+            result: null
+            error_code: null
+            output_bytes: 52
+            output_truncated: false
+            cancel_requested: false
+          - id: 90212
+            device: {id: 44, hostname: PC-ACC-015}
+            state: rejected
+            ring: 0
+            attempt: 1
+            queued_at: '2026-09-29T08:00:00Z'
+            dispatched_at: '2026-09-29T08:00:52Z'
+            started_at: null
+            finished_at: '2026-09-29T08:00:53Z'
+            exit_code: null
+            result: null
+            error_code: powershell_unsupported
+            output_bytes: 0
+            output_truncated: false
+            cancel_requested: false
+        next_cursor: null
+    AgentTaskDetails:
+      allOf:
+        - $ref: '#/components/schemas/AgentTaskSummary'
+        - type: object
+          required: [stdout, stderr]
+          properties:
+            stdout:
+              type: string
+              description: UTF-8 (агент перекодирует из OEM-кодировки консоли), не больше max_output_bytes версии
+            stderr:
+              type: string
+            error_detail:
+              type: [string, 'null']
+            output_purged_at:
+              type: [string, 'null']
+              format: date-time
+              description: Вывод удалён по сроку хранения
+
+    SoftwarePackageInput:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        vendor:
+          type: string
+          maxLength: 200
+        description:
+          type: string
+          maxLength: 4000
+        software_id:
+          type: [integer, 'null']
+          format: int64
+          description: Запись каталога инвентаризации ПО — по ней считается соответствие политикам
+      example:
+        name: Google Chrome
+        vendor: Google LLC
+        description: Браузер, корпоративный MSI
+        software_id: 2
+    SoftwarePackage:
+      type: object
+      required: [id, name, vendor, created_by, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        vendor:
+          type: string
+        description:
+          type: string
+        software_id:
+          type: [integer, 'null']
+          format: int64
+        created_by:
+          $ref: '#/components/schemas/UserRef'
+        created_at:
+          type: string
+          format: date-time
+        archived_at:
+          type: [string, 'null']
+          format: date-time
+        versions:
+          type: array
+          description: Только в `GET /api/v1/packages/{packageId}`
+          items:
+            $ref: '#/components/schemas/PackageVersionSummary'
+    PackageVersionSummary:
+      type: object
+      required: [id, version, arch, installer_type, status, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        version:
+          type: string
+        arch:
+          type: string
+          enum: [x86, x64, arm64, any]
+        installer_type:
+          type: string
+          enum: [msi, exe, script]
+        status:
+          $ref: '#/components/schemas/ArtifactStatus'
+        created_at:
+          type: string
+          format: date-time
+    SoftwarePackagePage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SoftwarePackage'
+        next_cursor:
+          type: [string, 'null']
+    PackageFile:
+      type: object
+      required: [sha256, size, file_name, authenticode]
+      properties:
+        sha256:
+          $ref: '#/components/schemas/Sha256Hex'
+        size:
+          $ref: '#/components/schemas/Bytes'
+        file_name:
+          type: string
+        authenticode:
+          type: object
+          required: [status]
+          description: Проверка на сервере — для информации; решающая проверка — на ПК
+          properties:
+            status:
+              type: string
+              enum: [valid, invalid, unsigned, not_checked]
+            signer:
+              type: [string, 'null']
+              description: Субъект сертификата издателя
+      example:
+        sha256: a01c7770d00d62efa5311a5a9d8c6f4f068eff1e7e1382ffe93e34cc79bd4566
+        size: 118784000
+        file_name: googlechromestandaloneenterprise64.msi
+        authenticode: {status: valid, signer: Google LLC}
+    Detection:
+      type: object
+      description: |
+        Как агент определяет, установлено ли ПО (до и после установки):
+        * `msi_product_code` — продукт с `product_code` зарегистрирован в Windows Installer;
+        * `uninstall_entry` — запись в Uninstall (HKLM, 32- и 64-битная ветки): `display_name` —
+          регулярное выражение, версия не ниже `min_version`;
+        * `file_version` — версия файла `path` (переменные окружения раскрываются) не ниже `min_version`;
+        * `registry_value` — значение `value_name` ключа `key` (HKLM) не ниже `min_version`.
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [msi_product_code, uninstall_entry, file_version, registry_value]
+        product_code:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+          maxLength: 200
+        path:
+          type: string
+          maxLength: 260
+        key:
+          type: string
+          maxLength: 260
+        value_name:
+          type: string
+          maxLength: 200
+        min_version:
+          type: string
+          maxLength: 50
+    PackageVersionInput:
+      type: object
+      required: [version, arch, installer_type, detection]
+      properties:
+        version:
+          type: string
+          maxLength: 100
+        arch:
+          type: string
+          enum: [x86, x64, arm64, any]
+        installer_type:
+          type: string
+          enum: [msi, exe, script]
+        file_sha256:
+          $ref: '#/components/schemas/Sha256Hex'
+        install_args:
+          type: string
+          maxLength: 2000
+          description: EXE — ключи тихой установки; MSI — только свойства `ИМЯ=значение` (ключи msiexec задаёт агент)
+        uninstall_command:
+          type: [string, 'null']
+          maxLength: 260
+          description: EXE — путь к деинсталлятору (переменные окружения раскрываются); без него удаление недоступно
+        uninstall_args:
+          type: string
+          maxLength: 2000
+        msi_product_code:
+          type: [string, 'null']
+          format: uuid
+        install_script_version_id:
+          type: [integer, 'null']
+          format: int64
+          description: Для installer_type `script` — одобренная версия скрипта; её код входит в манифест пакета
+        uninstall_script_version_id:
+          type: [integer, 'null']
+          format: int64
+        detection:
+          $ref: '#/components/schemas/Detection'
+        success_exit_codes:
+          type: array
+          maxItems: 20
+          default: [0, 1641, 3010]
+          items:
+            type: integer
+        timeout_s:
+          type: integer
+          minimum: 60
+          maximum: 14400
+          default: 3600
+        reboot_behavior:
+          type: string
+          enum: [suppress, allow_in_window]
+          default: suppress
+        require_authenticode:
+          type: boolean
+          default: true
+        expected_signer:
+          type: [string, 'null']
+          maxLength: 200
+      example:
+        version: 129.0.6668.90
+        arch: x64
+        installer_type: msi
+        file_sha256: a01c7770d00d62efa5311a5a9d8c6f4f068eff1e7e1382ffe93e34cc79bd4566
+        install_args: ''
+        msi_product_code: 6f2a0e1c-3b8d-4c5e-9a7f-1d2e3f4a5b6c
+        detection:
+          type: uninstall_entry
+          display_name: '^Google Chrome$'
+          min_version: 129.0.6668.90
+        success_exit_codes: [0, 1641, 3010]
+        timeout_s: 1800
+        reboot_behavior: suppress
+        require_authenticode: true
+        expected_signer: Google LLC
+    PackageVersion:
+      type: object
+      required: [id, package_id, version, arch, installer_type, status, detection, success_exit_codes, timeout_s,
+                 reboot_behavior, require_authenticode, uploaded_by, created_at, signatures]
+      properties:
+        id:
+          type: integer
+          format: int64
+        package_id:
+          type: integer
+          format: int64
+        version:
+          type: string
+        arch:
+          type: string
+          enum: [x86, x64, arm64, any]
+        installer_type:
+          type: string
+          enum: [msi, exe, script]
+        file_name:
+          type: [string, 'null']
+        file_sha256:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{64}$'
+        file_size:
+          type: [integer, 'null']
+          format: int64
+        install_args:
+          type: string
+        uninstall_command:
+          type: [string, 'null']
+        uninstall_args:
+          type: string
+        msi_product_code:
+          type: [string, 'null']
+          format: uuid
+        detection:
+          $ref: '#/components/schemas/Detection'
+        success_exit_codes:
+          type: array
+          items:
+            type: integer
+        timeout_s:
+          type: integer
+        reboot_behavior:
+          type: string
+          enum: [suppress, allow_in_window]
+        require_authenticode:
+          type: boolean
+        expected_signer:
+          type: [string, 'null']
+        status:
+          $ref: '#/components/schemas/ArtifactStatus'
+        manifest_sha256:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{64}$'
+        uploaded_by:
+          $ref: '#/components/schemas/UserRef'
+        created_at:
+          type: string
+          format: date-time
+        submitted_at:
+          type: [string, 'null']
+          format: date-time
+        decided_at:
+          type: [string, 'null']
+          format: date-time
+        signatures:
+          type: array
+          items:
+            $ref: '#/components/schemas/SignatureInfo'
+
+    MaintenanceWindow:
+      type: object
+      description: Окно, переходящее через полночь, относится к дню начала (пн 20:00–06:00 включает утро вторника)
+      required: [days, from, to, tz]
+      additionalProperties: false
+      properties:
+        days:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum: [mon, tue, wed, thu, fri, sat, sun]
+        from:
+          type: string
+          pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+        to:
+          type: string
+          pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$'
+        tz:
+          type: string
+          description: Часовой пояс IANA
+          examples: [Europe/Moscow]
+    Ring:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          maxLength: 50
+        tag:
+          type: string
+          description: ПК с этим тегом попадают в кольцо; кольцо без tag и percent — все оставшиеся ПК
+        percent:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: Доля оставшихся ПК (выбор детерминирован по agent_uid)
+        soak_hours:
+          type: integer
+          minimum: 0
+          maximum: 720
+          description: Выдержка после завершения кольца перед открытием следующего
+    DeploymentInput:
+      type: object
+      required: [package_version_id, action, targets, reason]
+      properties:
+        package_version_id:
+          type: integer
+          format: int64
+        action:
+          type: string
+          enum: [install, uninstall, update]
+          description: update — только на ПК, где обнаружена более старая версия
+        targets:
+          $ref: '#/components/schemas/TargetSpec'
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 1000
+        not_before:
+          type: string
+          format: date-time
+        deadline:
+          type: string
+          format: date-time
+          description: После дедлайна задачи выдаются и вне окна обслуживания
+        expires_in_hours:
+          type: integer
+          minimum: 1
+          maximum: 720
+          default: 168
+        maintenance_window:
+          $ref: '#/components/schemas/MaintenanceWindow'
+        ring_plan:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items:
+            $ref: '#/components/schemas/Ring'
+        max_failure_pct:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 10
+        reboot_policy:
+          type: string
+          enum: [suppress, allow_in_window]
+          default: suppress
+          description: allow_in_window — перезагрузка только в окне обслуживания и без активного сеанса пользователя
+      example:
+        package_version_id: 17
+        action: install
+        targets: {group_ids: [3]}
+        reason: 'CHG-311: корпоративный браузер для бухгалтерии'
+        deadline: '2026-10-09T15:00:00Z'
+        expires_in_hours: 336
+        maintenance_window: {days: [mon, tue, wed, thu, fri], from: '20:00', to: '06:00', tz: Europe/Moscow}
+        ring_plan:
+          - {name: pilot, tag: pilot, soak_hours: 24}
+          - {name: broad}
+        max_failure_pct: 10
+        reboot_policy: suppress
+    Deployment:
+      type: object
+      required: [id, status, package, action, targets, target_count, excluded, reason, created_at, not_before,
+                 expires_at, ring_plan, current_ring, max_failure_pct, reboot_policy, requires_approval, signatures, counts]
+      properties:
+        id:
+          type: integer
+          format: int64
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        package:
+          type: object
+          required: [id, name, version_id, version, arch]
+          properties:
+            id:
+              type: integer
+              format: int64
+            name:
+              type: string
+            version_id:
+              type: integer
+              format: int64
+            version:
+              type: string
+            arch:
+              type: string
+              enum: [x86, x64, arm64, any]
+        action:
+          type: string
+          enum: [install, uninstall, update]
+        policy_id:
+          type: [integer, 'null']
+          format: int64
+          description: Создано политикой (тогда created_by отсутствует)
+        targets:
+          $ref: '#/components/schemas/TargetSpec'
+        target_count:
+          type: integer
+        excluded:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExcludedTarget'
+        reason:
+          type: string
+        created_by:
+          $ref: '#/components/schemas/UserRef'
+        created_at:
+          type: string
+          format: date-time
+        not_before:
+          type: string
+          format: date-time
+        deadline:
+          type: [string, 'null']
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        maintenance_window:
+          $ref: '#/components/schemas/MaintenanceWindow'
+        ring_plan:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ring'
+        current_ring:
+          type: integer
+          description: Выдаются задачи колец 0..current_ring
+        max_failure_pct:
+          type: integer
+        reboot_policy:
+          type: string
+          enum: [suppress, allow_in_window]
+        paused_reason:
+          type: [string, 'null']
+        requires_approval:
+          type: boolean
+        run_manifest_sha256:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{64}$'
+        signatures:
+          type: array
+          items:
+            $ref: '#/components/schemas/SignatureInfo'
+        counts:
+          $ref: '#/components/schemas/JobCounts'
+        finished_at:
+          type: [string, 'null']
+          format: date-time
+      example:
+        id: 77
+        status: paused
+        package: {id: 5, name: Google Chrome, version_id: 17, version: 129.0.6668.90, arch: x64}
+        action: install
+        policy_id: null
+        targets: {group_ids: [3]}
+        target_count: 19
+        excluded: []
+        reason: 'CHG-311: корпоративный браузер для бухгалтерии'
+        created_by: {id: 4, username: sidorov, display_name: Сидоров С. С.}
+        created_at: '2026-09-29T09:00:00Z'
+        not_before: '2026-09-29T09:00:00Z'
+        deadline: '2026-10-09T15:00:00Z'
+        expires_at: '2026-10-13T09:00:00Z'
+        maintenance_window: {days: [mon, tue, wed, thu, fri], from: '20:00', to: '06:00', tz: Europe/Moscow}
+        ring_plan:
+          - {name: pilot, tag: pilot, soak_hours: 24}
+          - {name: broad}
+        current_ring: 0
+        max_failure_pct: 10
+        reboot_policy: suppress
+        paused_reason: 'Автопауза: в кольце pilot ошибок 1 из 3 (33 %) при пороге 10 %'
+        requires_approval: false
+        run_manifest_sha256: null
+        signatures: []
+        counts: {tasks: 19, queued: 16, in_progress: 0, succeeded: 2, failed: 1, lost: 0, rejected: 0, canceled_or_expired: 0, reboot_required: 1}
+        finished_at: null
+    DeploymentPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Deployment'
+        next_cursor:
+          type: [string, 'null']
+    DeploymentPolicyInput:
+      type: object
+      required: [name, package_id, intent]
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        package_id:
+          type: integer
+          format: int64
+        intent:
+          type: string
+          enum: [required, prohibited]
+          description: required — должно быть установлено; prohibited — должно отсутствовать
+        version_rule:
+          type: string
+          enum: [any, minimum, latest]
+          default: any
+          description: Для required — any (любая версия), minimum (не ниже min_version), latest (последняя одобренная)
+        min_version:
+          type: [string, 'null']
+        scope_group_id:
+          type: [integer, 'null']
+          format: int64
+        scope_tag:
+          type: [string, 'null']
+        maintenance_window:
+          $ref: '#/components/schemas/MaintenanceWindow'
+        ring_plan:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items:
+            $ref: '#/components/schemas/Ring'
+        max_failure_pct:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 10
+        reboot_policy:
+          type: string
+          enum: [suppress, allow_in_window]
+          default: suppress
+      example:
+        name: Chrome у бухгалтерии — последняя одобренная версия
+        package_id: 5
+        intent: required
+        version_rule: latest
+        scope_group_id: 3
+        maintenance_window: {days: [mon, tue, wed, thu, fri], from: '20:00', to: '06:00', tz: Europe/Moscow}
+        ring_plan:
+          - {name: pilot, tag: pilot, soak_hours: 24}
+          - {name: broad}
+        max_failure_pct: 10
+        reboot_policy: suppress
+    DeploymentPolicyPatch:
+      type: object
+      minProperties: 1
+      properties:
+        enabled:
+          type: boolean
+          const: false
+          description: Выключить политику; включает только `approve`
+        version_rule:
+          type: string
+          enum: [any, minimum, latest]
+        min_version:
+          type: [string, 'null']
+        scope_group_id:
+          type: [integer, 'null']
+          format: int64
+        scope_tag:
+          type: [string, 'null']
+        maintenance_window:
+          $ref: '#/components/schemas/MaintenanceWindow'
+        ring_plan:
+          type: array
+          minItems: 1
+          maxItems: 5
+          items:
+            $ref: '#/components/schemas/Ring'
+        max_failure_pct:
+          type: integer
+          minimum: 1
+          maximum: 100
+        reboot_policy:
+          type: string
+          enum: [suppress, allow_in_window]
+    DeploymentPolicy:
+      type: object
+      required: [id, name, package_id, intent, version_rule, enabled, max_failure_pct, reboot_policy, ring_plan,
+                 created_by, created_at, updated_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        package_id:
+          type: integer
+          format: int64
+        intent:
+          type: string
+          enum: [required, prohibited]
+        version_rule:
+          type: string
+          enum: [any, minimum, latest]
+        min_version:
+          type: [string, 'null']
+        scope_group_id:
+          type: [integer, 'null']
+          format: int64
+        scope_tag:
+          type: [string, 'null']
+        maintenance_window:
+          $ref: '#/components/schemas/MaintenanceWindow'
+        ring_plan:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ring'
+        max_failure_pct:
+          type: integer
+        reboot_policy:
+          type: string
+          enum: [suppress, allow_in_window]
+        enabled:
+          type: boolean
+        created_by:
+          $ref: '#/components/schemas/UserRef'
+        approved_by:
+          $ref: '#/components/schemas/UserRef'
+        approved_at:
+          type: [string, 'null']
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    PolicyCompliance:
+      type: object
+      required: [policy_id, evaluated_at, in_scope, compliant, non_compliant, in_progress, failed, devices]
+      properties:
+        policy_id:
+          type: integer
+          format: int64
+        evaluated_at:
+          type: string
+          format: date-time
+        in_scope:
+          type: integer
+        compliant:
+          type: integer
+        non_compliant:
+          type: integer
+        in_progress:
+          type: integer
+        failed:
+          type: integer
+        devices:
+          type: array
+          maxItems: 500
+          description: ПК, не соответствующие политике (не больше 500)
+          items:
+            type: object
+            required: [device, state]
+            properties:
+              device:
+                type: object
+                required: [id, hostname]
+                properties:
+                  id:
+                    type: integer
+                    format: int64
+                  hostname:
+                    type: string
+              state:
+                type: string
+                enum: [missing, outdated, present_prohibited, in_progress, failed]
+              installed_version:
+                type: [string, 'null']
+              deployment_id:
+                type: [integer, 'null']
+                format: int64
+      example:
+        policy_id: 9
+        evaluated_at: '2026-09-29T10:00:00Z'
+        in_scope: 20
+        compliant: 17
+        non_compliant: 1
+        in_progress: 1
+        failed: 1
+        devices:
+          - {device: {id: 44, hostname: PC-ACC-015}, state: outdated, installed_version: 128.0.6613.120, deployment_id: null}
+          - {device: {id: 47, hostname: PC-ACC-018}, state: in_progress, installed_version: null, deployment_id: 81}
+          - {device: {id: 51, hostname: PC-ACC-022}, state: failed, installed_version: null, deployment_id: 81}
+
+    ExecutionSettings:
+      type: object
+      required: [enabled, approval_required_above_targets, dispatch_lease_s, result_grace_s, max_dispatch_attempts,
+                 output_retention_days]
+      properties:
+        enabled:
+          type: boolean
+          description: Модуль включён; включить можно только при настроенной пересылке аудита в SIEM
+        paused:
+          type: boolean
+          readOnly: true
+          description: Включён стоп-кран
+        paused_reason:
+          type: [string, 'null']
+          readOnly: true
+        paused_at:
+          type: [string, 'null']
+          format: date-time
+          readOnly: true
+        approval_required_above_targets:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 25
+          description: Запуск и развёртывание на большее число ПК требуют подписей инициатора и согласующего
+        dispatch_lease_s:
+          type: integer
+          minimum: 60
+          maximum: 3600
+          default: 600
+        result_grace_s:
+          type: integer
+          minimum: 60
+          maximum: 3600
+          default: 300
+        max_dispatch_attempts:
+          type: integer
+          minimum: 1
+          maximum: 10
+          default: 3
+        output_retention_days:
+          type: integer
+          minimum: 7
+          maximum: 365
+          default: 90
+        siem_forwarding_configured:
+          type: boolean
+          readOnly: true
+      example:
+        enabled: true
+        paused: false
+        paused_reason: null
+        paused_at: null
+        approval_required_above_targets: 25
+        dispatch_lease_s: 600
+        result_grace_s: 300
+        max_dispatch_attempts: 3
+        output_retention_days: 90
+        siem_forwarding_configured: true
+    KillSwitchInput:
+      type: object
+      required: [engaged, reason]
+      properties:
+        engaged:
+          type: boolean
+        reason:
+          type: string
+          minLength: 5
+          maxLength: 1000
+        cancel_running:
+          type: boolean
+          default: false
+          description: Также отправить сигнал отмены выполняемым задачам
+      example:
+        engaged: true
+        reason: 'INC-1101: подозрение на компрометацию ключа подписанта'
+        cancel_running: true
+    SigningKeyInput:
+      type: object
+      required: [owner_id, name, public_key]
+      properties:
+        owner_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+          maxLength: 200
+        public_key:
+          type: string
+          contentEncoding: base64
+          description: SubjectPublicKeyInfo (DER) ключа ECDSA P-256
+        attestation:
+          type: array
+          maxItems: 3
+          description: Аттестация PIV (сертификат слота и сертификат устройства, DER) — ключ создан на токене
+          items:
+            type: string
+            contentEncoding: base64
+    SigningKey:
+      type: object
+      required: [id, owner, name, algorithm, fingerprint, attested, created_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        owner:
+          $ref: '#/components/schemas/UserRef'
+        name:
+          type: string
+        algorithm:
+          type: string
+          enum: [ecdsa-p256-sha256]
+        fingerprint:
+          $ref: '#/components/schemas/Sha256Hex'
+        attested:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: [string, 'null']
+          format: date-time
+      example:
+        id: 3
+        owner: {id: 3, username: ivanov, display_name: Иванов И. И.}
+        name: YubiKey 5 NFC, серийный 18 734 211
+        algorithm: ecdsa-p256-sha256
+        fingerprint: 7b1f33d829683c4149dc258514814a5b068fcec2851a2144f284f9adcf4e6fe6
+        attested: true
+        created_at: '2026-09-01T10:00:00Z'
+        revoked_at: null
+    PermissionGrantInput:
+      type: object
+      required: [user_id, permission]
+      properties:
+        user_id:
+          type: integer
+          format: int64
+        permission:
+          $ref: '#/components/schemas/Permission'
+        scope_group_id:
+          type: [integer, 'null']
+          format: int64
+          description: Группа устройств; null — весь парк
+      example:
+        user_id: 4
+        permission: script.run
+        scope_group_id: 3
+    PermissionGrant:
+      type: object
+      required: [id, user, permission, granted_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        user:
+          $ref: '#/components/schemas/UserRef'
+        permission:
+          $ref: '#/components/schemas/Permission'
+        scope_group_id:
+          type: [integer, 'null']
+          format: int64
+        granted_by:
+          $ref: '#/components/schemas/UserRef'
+        granted_at:
+          type: string
+          format: date-time
+
+    # --------------------------------------- Agent API: задачи (v2.0, проект)
+    ExecutionCapabilities:
+      type: object
+      description: |
+        Что разрешено на ПК **локальной политикой** (HKLM\SOFTWARE\Policies\InvMon\Agent, GPO), а не
+        сервером: сервер не может включить выполнение или добавить доверенный ключ.
+      required: [scripts_enabled, packages_enabled, trusted_key_fingerprints]
+      properties:
+        scripts_enabled:
+          type: boolean
+        packages_enabled:
+          type: boolean
+        trusted_key_fingerprints:
+          type: array
+          maxItems: 50
+          items:
+            $ref: '#/components/schemas/Sha256Hex'
+        org:
+          type: string
+          description: OrgId из политики; должен совпадать с полем `org` манифестов
+        powershell_version:
+          type: [string, 'null']
+          examples: ['5.1', '2.0']
+    SignedBlob:
+      type: object
+      required: [manifest, signatures]
+      properties:
+        manifest:
+          type: string
+          contentEncoding: base64
+          description: |
+            Точные подписанные байты — канонический JSON. Агент проверяет подписи над этими байтами
+            и только потом разбирает их; код скрипта берётся из манифеста.
+        signatures:
+          type: array
+          minItems: 2
+          maxItems: 5
+          items:
+            type: object
+            required: [role, key_fingerprint, public_key, signature]
+            properties:
+              role:
+                type: string
+                enum: [author, approver]
+              key_fingerprint:
+                $ref: '#/components/schemas/Sha256Hex'
+              public_key:
+                type: string
+                contentEncoding: base64
+                description: |
+                  SubjectPublicKeyInfo (DER). Агент принимает ключ, только если SHA-256 от него есть
+                  в локальном списке `TrustedSigners`: GPO хранит отпечатки, сервер доставляет ключи
+              signature:
+                type: string
+                contentEncoding: base64
+    AgentTask:
+      type: object
+      required: [task_id, kind, attempt, lease_expires_at, requested_by, reason, artifact]
+      properties:
+        task_id:
+          type: integer
+          format: int64
+        kind:
+          type: string
+          enum: [script, package]
+        attempt:
+          type: integer
+        lease_expires_at:
+          type: string
+          format: date-time
+          description: До этого времени агент подтверждает старт событием `started`
+        requested_by:
+          type: string
+          description: Логин инициатора — для журнала событий ПК
+        reason:
+          type: string
+        artifact:
+          $ref: '#/components/schemas/SignedBlob'
+        parameters:
+          type: object
+          additionalProperties: true
+          description: Только для скриптов; агент проверяет по `params_schema` из подписанного манифеста
+        run_approval:
+          $ref: '#/components/schemas/SignedBlob'
+        action:
+          type: string
+          enum: [install, uninstall, update]
+          description: Только для пакетов
+        download:
+          type: object
+          required: [url, sha256, size]
+          properties:
+            url:
+              type: string
+              format: uri-reference
+            sha256:
+              $ref: '#/components/schemas/Sha256Hex'
+            size:
+              $ref: '#/components/schemas/Bytes'
+        deadline:
+          type: [string, 'null']
+          format: date-time
+        reboot_policy:
+          type: string
+          enum: [suppress, allow_in_window]
+    TaskClaimRequest:
+      type: object
+      required: [max_tasks, capabilities]
+      properties:
+        max_tasks:
+          type: integer
+          minimum: 1
+          maximum: 5
+          default: 1
+        capabilities:
+          $ref: '#/components/schemas/ExecutionCapabilities'
+      example:
+        max_tasks: 1
+        capabilities:
+          scripts_enabled: true
+          packages_enabled: true
+          trusted_key_fingerprints:
+            - 0976d74509a4d74b592322296e90d2464ebed6d0604d8b93a7efecac3c690d97
+            - 7b1f33d829683c4149dc258514814a5b068fcec2851a2144f284f9adcf4e6fe6
+          org: corp.local
+          powershell_version: '5.1'
+    TaskClaimResponse:
+      type: object
+      required: [tasks]
+      properties:
+        tasks:
+          type: array
+          maxItems: 5
+          items:
+            $ref: '#/components/schemas/AgentTask'
+      example:
+        tasks:
+          - task_id: 90211
+            kind: script
+            attempt: 1
+            lease_expires_at: '2026-09-29T08:10:41Z'
+            requested_by: sidorov
+            reason: 'INC-1024: мало места на C: у бухгалтерии'
+            artifact:
+              manifest: eyJ0eXBlIjoiaW52bW9uLnNjcmlwdC52MSIsIm9yZyI6ImNvcnAubG9jYWwiLCJzY3JpcHRfaWQiOjEyLCJ2ZXJzaW9uIjozfQ==
+              signatures:
+                - role: author
+                  key_fingerprint: 0976d74509a4d74b592322296e90d2464ebed6d0604d8b93a7efecac3c690d97
+                  public_key: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEPetrovEXAMPLEonly
+                  signature: Ruwuz0MFQWcfKTFN6uR7ixvNeiptEgBFt1hhW/BG+wbr/u/z+t1rug==
+                - role: approver
+                  key_fingerprint: 7b1f33d829683c4149dc258514814a5b068fcec2851a2144f284f9adcf4e6fe6
+                  public_key: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIvanovEXAMPLEonly
+                  signature: XdJLZAZ3MW325EOZfEQ8wYojuN+VGHGxxPq0JjRmwaP1uSqrLOWexg==
+            parameters: {min_age_days: 7}
+            deadline: null
+    TaskEventInput:
+      type: object
+      required: [type, seq, ts]
+      properties:
+        type:
+          type: string
+          enum: [started, output, heartbeat]
+        seq:
+          type: integer
+          minimum: 1
+          description: Монотонный номер события задачи; повтор уже принятого номера игнорируется
+        ts:
+          type: string
+          format: date-time
+        stdout:
+          type: string
+          maxLength: 65536
+          description: Очередной фрагмент вывода (UTF-8)
+        stderr:
+          type: string
+          maxLength: 65536
+      example:
+        type: output
+        seq: 2
+        ts: '2026-09-29T08:00:58Z'
+        stdout: 'Удалено файлов: 1532, освобождено МБ: 2150.4'
+    TaskEventResponse:
+      type: object
+      required: [cancel_requested, lease_expires_at]
+      properties:
+        cancel_requested:
+          type: boolean
+          description: Остановить процесс (завершить Job Object) и прислать итог `canceled`
+        lease_expires_at:
+          type: string
+          format: date-time
+          description: До какого времени сервер ждёт итог (таймаут версии + запас)
+      example:
+        cancel_requested: false
+        lease_expires_at: '2026-09-29T08:15:43Z'
+    TaskResultInput:
+      type: object
+      required: [state, finished_at, output_bytes, output_truncated, last_seq]
+      properties:
+        state:
+          type: string
+          enum: [succeeded, failed, timed_out, canceled, rejected]
+          description: rejected — агент отказался выполнять (процесс не запускался)
+        exit_code:
+          type: [integer, 'null']
+        result:
+          type: [string, 'null']
+          enum: [installed, already_installed, uninstalled, not_installed, reboot_required, null]
+        error_code:
+          type: [string, 'null']
+          enum: [signature_invalid, untrusted_signer, separation_of_duties, org_mismatch, manifest_invalid,
+                 hash_mismatch, params_invalid, execution_disabled, run_not_authorized, not_for_this_device,
+                 expired, replay, os_unsupported, powershell_unsupported, arch_mismatch, encoding_unsupported,
+                 authenticode_invalid, download_failed, msi_busy, detection_failed, agent_restarted,
+                 internal_error, null]
+        error_detail:
+          type: [string, 'null']
+          maxLength: 2000
+        started_at:
+          type: [string, 'null']
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        output_bytes:
+          type: integer
+          format: int64
+          description: Весь вывод процесса, включая отброшенное сверх лимита
+        output_truncated:
+          type: boolean
+        last_seq:
+          type: integer
+          minimum: 0
+          description: Номер последнего отправленного события — сервер проверяет, что вывод получен полностью
+      example:
+        state: succeeded
+        exit_code: 0
+        result: null
+        error_code: null
+        started_at: '2026-09-29T08:00:43Z'
+        finished_at: '2026-09-29T08:01:02Z'
+        output_bytes: 52
+        output_truncated: false
+        last_seq: 3
